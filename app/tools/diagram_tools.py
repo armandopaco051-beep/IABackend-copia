@@ -44,6 +44,8 @@ VALID_CARDINALITIES = {
     "1..*",
 }
 
+RELATION_TYPES_WITHOUT_CARDINALITY = {"generalization"}
+
 # hace la extraccion de los nodos del diagrama
 def get_nodes(diagrama: dict[str, Any]):
     contenido = diagrama.get("contenido") or {}
@@ -220,6 +222,8 @@ def build_create_class_body(arguments: dict[str, Any], autor_codigo: str):
         "y": arguments.get("y", 100),
         "attributes": normalize_attributes(arguments),
         "methods": normalize_methods(arguments),
+        "kind": arguments.get("kind", "class"),
+        "templateParameters": arguments.get("templateParameters", []),
         "autor_codigo": autor_codigo,
     }
 
@@ -246,8 +250,16 @@ def build_update_class_body(arguments: dict[str, Any], autor_codigo: str):
     if "methods" in arguments:
         body["methods"] = normalize_methods(arguments)
 
+    if "kind" in arguments:
+        body["kind"] = arguments["kind"]
+
+    if "templateParameters" in arguments:
+        body["templateParameters"] = arguments["templateParameters"]
+
     if len(body) == 1:
-        raise ValueError("update_class necesita name, attributes o methods")
+        raise ValueError(
+            "update_class necesita name, attributes, methods, kind o templateParameters"
+        )
 
     return body
 
@@ -304,27 +316,56 @@ def build_create_relation_body(
     if not source_id or not target_id:
         raise ValueError("create_relation necesita source/target o sourceName/targetName")
 
-    source_cardinality = arguments.get("sourceCardinality", "1")
-    target_cardinality = arguments.get("targetCardinality", "0..*")
-
-    if source_cardinality not in VALID_CARDINALITIES:
-        raise ValueError(f"Cardinalidad origen no permitida: {source_cardinality}")
-
-    if target_cardinality not in VALID_CARDINALITIES:
-        raise ValueError(f"Cardinalidad destino no permitida: {target_cardinality}")
-
     data = {
         "relationType": relation_type,
         "sourceClassId": source_id,
         "targetClassId": target_id,
-        "sourceCardinality": source_cardinality,
-        "targetCardinality": target_cardinality,
     }
+
+    if relation_type not in RELATION_TYPES_WITHOUT_CARDINALITY:
+        source_cardinality = arguments.get("sourceCardinality", "1")
+        target_cardinality = arguments.get("targetCardinality", "0..*")
+
+        if source_cardinality not in VALID_CARDINALITIES:
+            raise ValueError(f"Cardinalidad origen no permitida: {source_cardinality}")
+
+        if target_cardinality not in VALID_CARDINALITIES:
+            raise ValueError(f"Cardinalidad destino no permitida: {target_cardinality}")
+
+        if relation_type == "composition" and source_cardinality not in {"1", "0..1"}:
+            raise ValueError(
+                "En composition, sourceCardinality debe ser 1 o 0..1 porque una Parte "
+                "solo puede pertenecer a un Todo"
+            )
+
+        data["sourceCardinality"] = source_cardinality
+        data["targetCardinality"] = target_cardinality
+
+    if relation_type == "generalization":
+        data["childClassId"] = source_id
+        data["parentClassId"] = target_id
+
+    if relation_type in {"composition", "aggregation"}:
+        data["wholeClassId"] = source_id
+        data["partClassId"] = target_id
+
+    association_class_id = arguments.get("associationClassId")
+    association_class_name = arguments.get("associationClassName")
+    if not association_class_id and association_class_name:
+        association_node = find_class_by_name(diagrama, str(association_class_name))
+        if association_node is None:
+            raise ValueError(
+                f"No se encontro la clase de asociacion: {association_class_name}"
+            )
+        association_class_id = association_node["id"]
+    if relation_type == "associationClass" and not association_class_id:
+        raise ValueError("associationClass necesita associationClassId o associationClassName")
+    if association_class_id:
+        data["associationClassId"] = association_class_id
 
     for optional_key in (
         "sourceRole",
         "targetRole",
-        "associationClassId",
         "templateBindings",
         "name",
     ):
@@ -381,30 +422,52 @@ def build_update_relation_body(
     if relation_type not in VALID_RELATION_TYPES:
         raise ValueError(f"Tipo de relacion no permitido: {relation_type}")
 
-    source_cardinality = arguments.get("sourceCardinality")
-
-    if source_cardinality is None:
-        source_cardinality = (edge.get("data") or {}).get("sourceCardinality", "1")
-
-    target_cardinality = arguments.get("targetCardinality")
-
-    if target_cardinality is None:
-        target_cardinality = (edge.get("data") or {}).get("targetCardinality", "0..*")
-
-    if source_cardinality not in VALID_CARDINALITIES:
-        raise ValueError(f"Cardinalidad origen no permitida: {source_cardinality}")
-
-    if target_cardinality not in VALID_CARDINALITIES:
-        raise ValueError(f"Cardinalidad destino no permitida: {target_cardinality}")
-
     data = {
         **(edge.get("data") or {}),
         "relationType": relation_type,
         "sourceClassId": source_id,
         "targetClassId": target_id,
-        "sourceCardinality": source_cardinality,
-        "targetCardinality": target_cardinality,
     }
+
+    if relation_type in RELATION_TYPES_WITHOUT_CARDINALITY:
+        data.pop("sourceCardinality", None)
+        data.pop("targetCardinality", None)
+        data.pop("cardinality", None)
+    else:
+        source_cardinality = arguments.get("sourceCardinality")
+        if source_cardinality is None:
+            source_cardinality = (edge.get("data") or {}).get("sourceCardinality", "1")
+
+        target_cardinality = arguments.get("targetCardinality")
+        if target_cardinality is None:
+            target_cardinality = (edge.get("data") or {}).get("targetCardinality", "0..*")
+
+        if source_cardinality not in VALID_CARDINALITIES:
+            raise ValueError(f"Cardinalidad origen no permitida: {source_cardinality}")
+
+        if target_cardinality not in VALID_CARDINALITIES:
+            raise ValueError(f"Cardinalidad destino no permitida: {target_cardinality}")
+
+        if relation_type == "composition" and source_cardinality not in {"1", "0..1"}:
+            raise ValueError(
+                "En composition, sourceCardinality debe ser 1 o 0..1 porque una Parte "
+                "solo puede pertenecer a un Todo"
+            )
+
+        data["sourceCardinality"] = source_cardinality
+        data["targetCardinality"] = target_cardinality
+
+    association_class_id = arguments.get("associationClassId")
+    association_class_name = arguments.get("associationClassName")
+    if not association_class_id and association_class_name:
+        association_node = find_class_by_name(diagrama, str(association_class_name))
+        if association_node is None:
+            raise ValueError(
+                f"No se encontro la clase de asociacion: {association_class_name}"
+            )
+        association_class_id = association_node["id"]
+    if association_class_id:
+        data["associationClassId"] = association_class_id
 
     if relation_type == "generalization":
         data["childClassId"] = source_id
@@ -417,7 +480,6 @@ def build_update_relation_body(
     for optional_key in (
         "sourceRole",
         "targetRole",
-        "associationClassId",
         "templateBindings",
         "name",
     ):

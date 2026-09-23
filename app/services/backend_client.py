@@ -35,27 +35,14 @@ async def get_proyecto(proyecto_id: int, token: str | None = None):
 
 
 async def get_permisos_usuario(proyecto_id: int, token: str | None = None):
-    """
-    Obtiene los permisos y rol del usuario autenticado para un proyecto determinado.
-    """
+    """Obtiene el rol real del backend principal; nunca eleva permisos por fallback."""
     async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            response = await client.get(
-                f"{settings.BACKEND_API_URL}/proyectos/{proyecto_id}/permiso",
-                headers=build_headers(token),
-            )
-            if response.status_code == 200:
-                return response.json()
-        except Exception:
-            pass
-
-        # Fallback: consultar endpoint de proyecto y buscar rol
-        try:
-            proyecto_data = await get_proyecto(proyecto_id, token)
-            rol = proyecto_data.get("mi_rol") or proyecto_data.get("rol") or "EDITOR"
-            return {"rol": str(rol).upper(), "proyecto_id": proyecto_id}
-        except Exception:
-            return {"rol": "EDITOR", "proyecto_id": proyecto_id}
+        response = await client.get(
+            f"{settings.BACKEND_API_URL}/proyectos/{proyecto_id}/permiso",
+            headers=build_headers(token),
+        )
+        response.raise_for_status()
+        return response.json()
 
 async def create_class(diagrama_id: int, body: dict, token: str | None = None):
     async with httpx.AsyncClient(timeout=15) as client:

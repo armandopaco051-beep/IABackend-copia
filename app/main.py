@@ -1,5 +1,5 @@
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.agents.planner_agent import run_planner
@@ -22,6 +22,8 @@ from app.agents.suggestion_agent import run_suggestion
 from app.schemas.suggestion import SuggestionRequest, SuggestionResponse
 
 from app.agents.validation_agent import run_validation
+from app.agents.image_agent import detect_image_mime, run_image_agent
+from app.schemas.image_diagram import ImageDiagramResponse
 from app.schemas.validation import ValidationRequest, ValidationResponse
 app = FastAPI(
     title="DrawSchema AI Service",
@@ -105,7 +107,65 @@ def health():
         "modelo_suggestion": get_agent_model_name("suggestion"),
         "modelo_validation": get_agent_model_name("validation"),
         "modelo_codegen": get_agent_model_name("codegen"),
+        "modelo_image": get_agent_model_name("image"),
     }
+
+
+@app.post("/ai/image/analyze", response_model=ImageDiagramResponse)
+async def analyze_diagram_image(
+    image: UploadFile = File(...),
+    proyecto_id: int = Form(...),
+    diagrama_id: int = Form(...),
+    message: str = Form(default="Extrae el diagrama respetando sus multiplicidades"),
+    authorization: str | None = Header(default=None),
+):
+    token = extract_token(authorization)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token requerido para analizar una imagen del proyecto",
+        )
+
+    image_bytes = await image.read(settings.IMAGE_MAX_BYTES + 1)
+    await image.close()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="La imagen esta vacia")
+    if len(image_bytes) > settings.IMAGE_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"La imagen supera el limite de {settings.IMAGE_MAX_BYTES} bytes",
+        )
+
+    try:
+        mime_type = detect_image_mime(image_bytes, image.content_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+
+    context = await build_context(proyecto_id, diagrama_id, token)
+    diagram_project_id = (context.get("diagrama") or {}).get("id_proyecto")
+    if diagram_project_id != proyecto_id:
+        raise HTTPException(
+            status_code=400,
+            detail="El diagrama indicado no pertenece al proyecto",
+        )
+
+    try:
+        return await run_image_agent(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            message=message,
+            context=context,
+            filename=image.filename,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error del proveedor IA al analizar la imagen: {exc}",
+        ) from exc
 
 
 @app.post("/ai/chat", response_model=ChatResponse)

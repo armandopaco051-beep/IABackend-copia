@@ -33,6 +33,9 @@ async def verify_user_permission(
     if proyecto_id is None:
         return "EDITOR"
 
+    if not token:
+        raise HTTPException(status_code=401, detail="Token requerido")
+
     user_info = await get_permisos_usuario(proyecto_id, token)
     user_role = str(user_info.get("rol", "EDITOR")).upper()
 

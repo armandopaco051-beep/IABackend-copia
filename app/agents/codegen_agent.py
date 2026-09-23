@@ -110,10 +110,26 @@ Si una clase tiene metodos:
 - si no se puede deducir logica, deja TODO claro.
 
 Relaciones:
-- association con 1 a muchos -> @ManyToOne en el lado muchos.
-- composition -> usar CascadeType.ALL y orphanRemoval=true cuando sea OneToMany.
-- aggregation -> relacion sin orphanRemoval.
-- generalization -> usar herencia JPA basica si es posible.
+- Las multiplicidades pertenecen a association, associationClass, aggregation
+  y composition. Generalization no usa multiplicidad.
+- Interpreta sourceCardinality como cuantos objetos source puede tener un
+  target, y targetCardinality como cuantos objetos target puede tener un source.
+- 1/0..1 hacia 1/0..1 -> @OneToOne.
+- 1/0..1 hacia 0..*/1..* -> @OneToMany desde source.
+- 0..*/1..* hacia 1/0..1 -> @ManyToOne desde source.
+- muchos a muchos -> @ManyToMany.
+- composition: source es el Todo y target la Parte; usa CascadeType.ALL y
+  orphanRemoval=true. La cardinalidad del Todo por Parte debe ser 1 o 0..1.
+- aggregation: source es el Todo debil y target la Parte; no uses
+  orphanRemoval ni borrado en cascada.
+- associationClass: la clase intermedia es una entidad propia. Las PK de las
+  dos entidades relacionadas forman un `@EmbeddedId`; en la entidad intermedia
+  genera dos `@ManyToOne` con `@MapsId`, de modo que cada componente sea PK y
+  FK sin declarar la misma columna dos veces. El CRUD debe construir la clave
+  compuesta y buscar ambas entidades relacionadas antes de guardar.
+- generalization: source es la hija y target la padre; genera `extends` y una
+  estrategia JPA de herencia. Nunca generes cardinalidades para herencia.
+- Si solo hay colaboracion sin propiedad o ciclo de vida, tratala como association.
 - Si una relacion es ambigua, genera warning y codigo seguro.
 
 Base de datos:

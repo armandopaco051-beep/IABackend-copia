@@ -16,12 +16,35 @@ class Attribute:
     java_name: str
     java_type: str
     primary_key: bool
+    foreign_key: bool
     nullable: bool
+
+
+@dataclass
+class Relationship:
+    """Relacion JPA unidireccional calculada desde un edge UML."""
+
+    relation_type: str
+    field_name: str
+    target_class_name: str
+    target_table_name: str
+    source_cardinality: str
+    target_cardinality: str
+    annotation: str
+    collection: bool
+    required: bool
+    cascade_all: bool = False
+    orphan_removal: bool = False
+    maps_id: str | None = None
+    join_column: str | None = None
+    target_id_type: str | None = None
+
 
 @dataclass
 class Entity:
     """Representa una clase UML convertida en entidad candidata para Spring Boot."""
 
+    node_id: str
     name: str
     class_name: str
     variable_name: str
@@ -33,6 +56,9 @@ class Entity:
     is_composite_id: bool = False
     composite_id_class_name: str | None = None
     pk_attributes: list[Attribute] = field(default_factory=list)
+    relationships: list[Relationship] = field(default_factory=list)
+    parent_class_name: str | None = None
+    inheritance_parent: bool = False
 
 
 
@@ -133,14 +159,79 @@ def map_schema_type(java_type: str) -> str:
     return mappings.get(java_type, "string")
 
 
+def cardinality_is_many(value: str) -> bool:
+    """Indica si una multiplicidad UML representa una coleccion."""
+
+    return value in {"0..*", "1..*"}
+
+
+def relationship_annotation(source_cardinality: str, target_cardinality: str) -> str:
+    """Mapea las multiplicidades de ambos extremos a una anotacion JPA."""
+
+    source_many = cardinality_is_many(source_cardinality)
+    target_many = cardinality_is_many(target_cardinality)
+    if source_many and target_many:
+        return "ManyToMany"
+    if source_many:
+        return "ManyToOne"
+    if target_many:
+        return "OneToMany"
+    return "OneToOne"
+
+
+def unique_relationship_field(entity: Entity, base_name: str) -> str:
+    """Evita colisiones entre atributos del diagrama y campos de relacion."""
+
+    used = {attribute.java_name for attribute in entity.attributes}
+    used.update(relationship.field_name for relationship in entity.relationships)
+    candidate = base_name
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base_name}{suffix}"
+        suffix += 1
+    return candidate
+
+
+def find_association_key(
+    association_entity: Entity,
+    related_entity: Entity,
+    excluded: set[str],
+) -> Attribute | None:
+    """Localiza la PK/FK de la clase intermedia que referencia a una entidad."""
+
+    candidates = [
+        attribute
+        for attribute in association_entity.pk_attributes
+        if attribute.java_name not in excluded
+    ]
+    related_tokens = {
+        to_snake_case(related_entity.name),
+        to_snake_case(related_entity.class_name),
+        related_entity.table_name,
+    }
+
+    for attribute in candidates:
+        attribute_name = to_snake_case(attribute.name)
+        if attribute.foreign_key and any(token in attribute_name for token in related_tokens):
+            return attribute
+
+    for attribute in candidates:
+        attribute_name = to_snake_case(attribute.name)
+        if any(token in attribute_name for token in related_tokens):
+            return attribute
+
+    return next((attribute for attribute in candidates if attribute.foreign_key), None)
+
+
 def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
-    """Lee el JSONB del diagrama y lo transforma en entidades internas."""
+    """Lee nodes y edges del JSONB y los transforma en entidades JPA."""
 
     warnings: list[str] = []
     diagrama = context.get("diagrama") or {}
     contenido = diagrama.get("contenido") or {}
     nodes = contenido.get("nodes") or []
     entities: list[Entity] = []
+    entities_by_node_id: dict[str, Entity] = {}
     used_names: set[str] = set()
 
     for index, node in enumerate(nodes):
@@ -160,7 +251,18 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
             attr_name = str(attr.get("name") or f"campo{attr_index + 1}")
             java_name = to_camel_case(attr_name, f"field{attr_index + 1}")
             java_type = map_java_type(attr.get("type"))
-            primary_key = bool(attr.get("primaryKey"))
+            primary_key = bool(
+                attr.get("primaryKey")
+                or attr.get("isPrimaryKey")
+                or attr.get("primary_key")
+                or attr.get("isPk")
+            )
+            foreign_key = bool(
+                attr.get("foreignKey")
+                or attr.get("isForeignKey")
+                or attr.get("foreign_key")
+                or attr.get("isFk")
+            )
             nullable = bool(attr.get("nullable", True))
 
             attributes.append(
@@ -169,6 +271,7 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
                     java_name=java_name,
                     java_type=java_type,
                     primary_key=primary_key,
+                    foreign_key=foreign_key,
                     nullable=nullable,
                 )
             )
@@ -188,6 +291,7 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
                 java_name="id",
                 java_type=composite_id_class_name,
                 primary_key=True,
+                foreign_key=False,
                 nullable=False,
             )
             warnings.append(
@@ -196,6 +300,10 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
             )
         elif id_attributes:
             id_attribute = id_attributes[0]
+            generated_id = (
+                id_attribute.java_name.lower() == "id"
+                and id_attribute.java_type in {"Long", "Integer"}
+            )
         else:
             generated_id = True
             id_attribute = Attribute(
@@ -203,6 +311,7 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
                 java_name="id",
                 java_type="Long",
                 primary_key=True,
+                foreign_key=False,
                 nullable=False,
             )
             attributes.insert(0, id_attribute)
@@ -210,8 +319,8 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
                 f"La entidad {class_name} no tenia primaryKey; se genero id Long automaticamente."
             )
 
-        entities.append(
-            Entity(
+        entity = Entity(
+                node_id=str(node.get("id") or f"class-{index + 1}"),
                 name=raw_name,
                 class_name=class_name,
                 variable_name=to_camel_case(class_name),
@@ -224,11 +333,140 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
                 composite_id_class_name=composite_id_class_name,
                 pk_attributes=pk_attributes,
             )
-        )
+        entities.append(entity)
+        entities_by_node_id[entity.node_id] = entity
 
 
     if not entities:
         raise ValueError("No se puede generar backend porque el diagrama no tiene clases.")
+
+    for edge in contenido.get("edges") or []:
+        data = edge.get("data") or {}
+        relation_type = str(data.get("relationType") or "association")
+        source_id = str(data.get("sourceClassId") or edge.get("source") or "")
+        target_id = str(data.get("targetClassId") or edge.get("target") or "")
+        source = entities_by_node_id.get(source_id)
+        target = entities_by_node_id.get(target_id)
+
+        if source is None or target is None:
+            warnings.append(
+                f"Se omitio una relacion {relation_type} porque su origen o destino no existe."
+            )
+            continue
+
+        if relation_type == "generalization":
+            source.parent_class_name = target.class_name
+            target.inheritance_parent = True
+            source.id_attribute = target.id_attribute
+            source.generated_id = False
+            source.is_composite_id = False
+            source.composite_id_class_name = None
+            source.pk_attributes = []
+            source.attributes = [
+                target.id_attribute,
+                *[attribute for attribute in source.attributes if not attribute.primary_key],
+            ]
+            continue
+
+        if relation_type == "associationClass":
+            association_class_id = str(data.get("associationClassId") or "")
+            association_entity = entities_by_node_id.get(association_class_id)
+            if association_entity is None:
+                warnings.append(
+                    f"Se omitio associationClass {source.class_name}-{target.class_name}: "
+                    "no existe la clase intermedia."
+                )
+                continue
+            if not association_entity.is_composite_id:
+                warnings.append(
+                    f"La clase de asociacion {association_entity.class_name} necesita al menos "
+                    "dos atributos primaryKey=true y foreignKey=true."
+                )
+                continue
+
+            claimed_keys: set[str] = set()
+            association_pairs = ((source, data.get("sourceRole")), (target, data.get("targetRole")))
+            for related_entity, role in association_pairs:
+                mapped_key = find_association_key(
+                    association_entity,
+                    related_entity,
+                    claimed_keys,
+                )
+                if mapped_key is None:
+                    warnings.append(
+                        f"No se encontro la PK/FK de {related_entity.class_name} en "
+                        f"{association_entity.class_name}."
+                    )
+                    continue
+                if related_entity.is_composite_id:
+                    warnings.append(
+                        f"La relacion de {association_entity.class_name} con "
+                        f"{related_entity.class_name} usa otra clave compuesta y requiere "
+                        "revision manual."
+                    )
+                    continue
+
+                claimed_keys.add(mapped_key.java_name)
+                field_name = unique_relationship_field(
+                    association_entity,
+                    to_camel_case(str(role or related_entity.variable_name)),
+                )
+                association_entity.relationships.append(
+                    Relationship(
+                        relation_type="associationClass",
+                        field_name=field_name,
+                        target_class_name=related_entity.class_name,
+                        target_table_name=related_entity.table_name,
+                        source_cardinality="1",
+                        target_cardinality="1",
+                        annotation="ManyToOne",
+                        collection=False,
+                        required=True,
+                        maps_id=mapped_key.java_name,
+                        join_column=to_snake_case(mapped_key.name),
+                        target_id_type=related_entity.id_attribute.java_type,
+                    )
+                )
+
+            if len(claimed_keys) != 2:
+                warnings.append(
+                    f"La clase de asociacion {association_entity.class_name} no pudo enlazar "
+                    "correctamente las dos claves foraneas."
+                )
+            continue
+
+        if relation_type not in {"association", "composition", "aggregation"}:
+            continue
+
+        source_cardinality = str(data.get("sourceCardinality") or "1")
+        target_cardinality = str(data.get("targetCardinality") or "0..*")
+        if relation_type == "composition" and source_cardinality not in {"1", "0..1"}:
+            raise ValueError(
+                f"Composicion invalida {source.class_name} -> {target.class_name}: "
+                "una Parte solo puede pertenecer a un Todo (sourceCardinality 1 o 0..1)."
+            )
+        annotation = relationship_annotation(source_cardinality, target_cardinality)
+        collection = annotation in {"OneToMany", "ManyToMany"}
+        role_name = str(data.get("targetRole") or target.variable_name)
+        base_field_name = to_camel_case(role_name, target.variable_name)
+        if collection and not base_field_name.endswith("s"):
+            base_field_name = f"{base_field_name}s"
+
+        source.relationships.append(
+            Relationship(
+                relation_type=relation_type,
+                field_name=unique_relationship_field(source, base_field_name),
+                target_class_name=target.class_name,
+                target_table_name=target.table_name,
+                source_cardinality=source_cardinality,
+                target_cardinality=target_cardinality,
+                annotation=annotation,
+                collection=collection,
+                required=target_cardinality in {"1", "1..*"},
+                cascade_all=relation_type == "composition",
+                orphan_removal=relation_type == "composition" and annotation in {"OneToOne", "OneToMany"},
+            )
+        )
 
     return entities, warnings
 
@@ -267,7 +505,11 @@ def validation_annotation(attribute: Attribute) -> str | None:
     return "@NotNull"
 
 
-def field_declaration(attribute: Attribute, include_validation: bool = True) -> list[str]:
+def field_declaration(
+    attribute: Attribute,
+    include_validation: bool = True,
+    generated_id: bool = False,
+) -> list[str]:
     """Genera las lineas Java de un campo, incluyendo JPA y validaciones."""
 
     lines: list[str] = []
@@ -278,6 +520,7 @@ def field_declaration(attribute: Attribute, include_validation: bool = True) -> 
 
     if attribute.primary_key:
         lines.append("    @Id")
+    if generated_id:
         lines.append("    @GeneratedValue(strategy = GenerationType.IDENTITY)")
 
     column_parts = []
@@ -296,6 +539,7 @@ def generate_composite_id_class(base_package: str, entity: Entity) -> GeneratedF
     """Genera la clase @Embeddable para entidades con clave primaria compuesta (ej: DetallesPedidoId)."""
 
     imports = [
+        "jakarta.persistence.Column",
         "jakarta.persistence.Embeddable",
         "java.io.Serializable",
         "lombok.AllArgsConstructor",
@@ -308,7 +552,9 @@ def generate_composite_id_class(base_package: str, entity: Entity) -> GeneratedF
 
     fields: list[str] = []
     for attr in entity.pk_attributes:
+        fields.append(f'    @Column(name = "{to_snake_case(attr.name)}")')
         fields.append(f"    private {attr.java_type} {attr.java_name};")
+        fields.append("")
 
     content = "\n".join(
         [
@@ -338,8 +584,58 @@ def generate_composite_id_class(base_package: str, entity: Entity) -> GeneratedF
     )
 
 
+def relationship_field_declaration(entity: Entity, relationship: Relationship) -> list[str]:
+    """Genera una propiedad JPA respetando tipo UML, cardinalidad y ciclo de vida."""
+
+    options: list[str] = []
+    if relationship.cascade_all:
+        options.append("cascade = CascadeType.ALL")
+    if relationship.orphan_removal:
+        options.append("orphanRemoval = true")
+    if relationship.annotation in {"OneToOne", "ManyToOne"}:
+        options.append(f"optional = {str(not relationship.required).lower()}")
+
+    annotation = f"    @{relationship.annotation}"
+    if options:
+        annotation += f"({', '.join(options)})"
+
+    lines: list[str] = []
+    if relationship.maps_id:
+        lines.append(f'    @MapsId("{relationship.maps_id}")')
+    lines.append(annotation)
+    if relationship.annotation == "ManyToMany":
+        lines.extend(
+            [
+                "    @JoinTable(",
+                f'        name = "{entity.table_name}_{relationship.target_table_name}",',
+                f'        joinColumns = @JoinColumn(name = "{entity.variable_name}_id"),',
+                f'        inverseJoinColumns = @JoinColumn(name = "{relationship.field_name}_id")',
+                "    )",
+            ]
+        )
+    elif relationship.annotation == "OneToMany":
+        lines.append(f'    @JoinColumn(name = "{entity.variable_name}_id")')
+    else:
+        nullable = str(not relationship.required).lower()
+        join_column = relationship.join_column or f"{relationship.field_name}_id"
+        lines.append(
+            f'    @JoinColumn(name = "{join_column}", nullable = {nullable})'
+        )
+
+    if relationship.collection:
+        lines.append(
+            f"    private List<{relationship.target_class_name}> "
+            f"{relationship.field_name} = new ArrayList<>();"
+        )
+    else:
+        lines.append(
+            f"    private {relationship.target_class_name} {relationship.field_name};"
+        )
+    return lines
+
+
 def generate_model(base_package: str, entity: Entity) -> GeneratedFile:
-    """Genera el archivo model/Entity.java con anotaciones JPA."""
+    """Genera model/Entity.java, incluyendo herencia y relaciones JPA."""
 
     imports = [
         "jakarta.persistence.*",
@@ -350,13 +646,18 @@ def generate_model(base_package: str, entity: Entity) -> GeneratedFile:
     ]
 
     fields: list[str] = []
+    model_attributes = (
+        [attribute for attribute in entity.attributes if not attribute.primary_key]
+        if entity.parent_class_name
+        else entity.attributes
+    )
 
     if entity.is_composite_id:
         fields.append("    @EmbeddedId")
         fields.append(f"    private {entity.composite_id_class_name} id;")
         fields.append("")
 
-        non_pk_attributes = [attribute for attribute in entity.attributes if not attribute.primary_key]
+        non_pk_attributes = [attribute for attribute in model_attributes if not attribute.primary_key]
         validation_needed = any(validation_annotation(attribute) for attribute in non_pk_attributes)
 
         if validation_needed:
@@ -368,16 +669,35 @@ def generate_model(base_package: str, entity: Entity) -> GeneratedFile:
             fields.extend(field_declaration(attribute))
             fields.append("")
     else:
-        validation_needed = any(validation_annotation(attribute) for attribute in entity.attributes)
+        validation_needed = any(validation_annotation(attribute) for attribute in model_attributes)
 
         if validation_needed:
             imports.extend(["jakarta.validation.constraints.NotBlank", "jakarta.validation.constraints.NotNull"])
 
-        imports.extend(common_imports(entity.attributes))
+        imports.extend(common_imports(model_attributes))
 
-        for attribute in entity.attributes:
-            fields.extend(field_declaration(attribute))
+        for attribute in model_attributes:
+            fields.extend(
+                field_declaration(
+                    attribute,
+                    generated_id=entity.generated_id and attribute.primary_key,
+                )
+            )
             fields.append("")
+
+    if any(relationship.collection for relationship in entity.relationships):
+        imports.extend(["java.util.ArrayList", "java.util.List"])
+
+    for relationship in entity.relationships:
+        fields.extend(relationship_field_declaration(entity, relationship))
+        fields.append("")
+
+    inheritance_annotation = (
+        ["@Inheritance(strategy = InheritanceType.JOINED)"]
+        if entity.inheritance_parent
+        else []
+    )
+    extends_clause = f" extends {entity.parent_class_name}" if entity.parent_class_name else ""
 
     content = "\n".join(
         [
@@ -387,11 +707,12 @@ def generate_model(base_package: str, entity: Entity) -> GeneratedFile:
             "",
             "@Entity",
             f'@Table(name = "{entity.table_name}")',
+            *inheritance_annotation,
             "@Getter",
             "@Setter",
             "@NoArgsConstructor",
             "@AllArgsConstructor",
-            f"public class {entity.class_name} {{",
+            f"public class {entity.class_name}{extends_clause} {{",
             *fields,
             "}",
             "",
@@ -409,9 +730,14 @@ def generate_model(base_package: str, entity: Entity) -> GeneratedFile:
 def generate_repository(base_package: str, entity: Entity) -> GeneratedFile:
     """Genera el repository que extiende JpaRepository."""
 
+    id_import = ""
+    if entity.is_composite_id:
+        id_import = f"import {base_package}.models.{entity.composite_id_class_name};"
+
     content = f"""package {base_package}.repositories;
 
 import {base_package}.models.{entity.class_name};
+{id_import}
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
@@ -427,11 +753,13 @@ public interface {entity.class_name}Repository extends JpaRepository<{entity.cla
     )
 
 
-def dto_field_declaration(attribute: Attribute) -> list[str]:
+def dto_field_declaration(attribute: Attribute, required: bool = False) -> list[str]:
     """Genera las lineas de un campo para DTO (solo validaciones Jakarta, sin anotaciones JPA @Column/@Id)."""
 
     lines: list[str] = []
     validation = validation_annotation(attribute)
+    if required:
+        validation = "@NotBlank" if attribute.java_type == "String" else "@NotNull"
 
     if validation:
         lines.append(f"    {validation}")
@@ -443,12 +771,20 @@ def dto_field_declaration(attribute: Attribute) -> list[str]:
 def generate_request_dto(base_package: str, entity: Entity) -> GeneratedFile:
     """Genera el DTO usado para crear o actualizar una entidad."""
 
-    attributes = [attribute for attribute in entity.attributes if not attribute.primary_key]
+    attributes = [
+        attribute
+        for attribute in entity.attributes
+        if not attribute.primary_key or entity.is_composite_id or not entity.generated_id
+    ]
     imports = [
         "lombok.Getter",
         "lombok.Setter",
     ]
-    validation_needed = any(validation_annotation(attribute) for attribute in attributes)
+    validation_needed = any(
+        attribute.primary_key and not entity.generated_id for attribute in attributes
+    ) or any(
+        validation_annotation(attribute) for attribute in attributes
+    )
 
     if validation_needed:
         imports.extend(["jakarta.validation.constraints.NotBlank", "jakarta.validation.constraints.NotNull"])
@@ -458,7 +794,12 @@ def generate_request_dto(base_package: str, entity: Entity) -> GeneratedFile:
     fields: list[str] = []
 
     for attribute in attributes:
-        fields.extend(dto_field_declaration(attribute))
+        fields.extend(
+            dto_field_declaration(
+                attribute,
+                required=attribute.primary_key and not entity.generated_id,
+            )
+        )
         fields.append("")
 
     content = "\n".join(
@@ -539,14 +880,83 @@ def generate_service(base_package: str, entity: Entity) -> GeneratedFile:
     request_var = "request"
     model_var = entity.variable_name
     editable_attributes = [attribute for attribute in entity.attributes if not attribute.primary_key]
+    create_attributes = [
+        attribute
+        for attribute in entity.attributes
+        if not attribute.primary_key or (not entity.generated_id and not entity.is_composite_id)
+    ]
+    mapped_relationships = [
+        relationship for relationship in entity.relationships if relationship.maps_id
+    ]
 
-    request_assignments = [
+    create_attribute_assignments = [
+        f"        {model_var}.{setter_name(attribute)}({request_var}.{getter_name(attribute)}());"
+        for attribute in create_attributes
+    ]
+    update_attribute_assignments = [
         f"        {model_var}.{setter_name(attribute)}({request_var}.{getter_name(attribute)}());"
         for attribute in editable_attributes
     ]
     response_args = ", ".join(
-        f"{model_var}.{getter_name(attribute)}()" for attribute in entity.attributes
+        (
+            f"{model_var}.getId().{getter_name(attribute)}()"
+            if entity.is_composite_id and attribute.primary_key
+            else f"{model_var}.{getter_name(attribute)}()"
+        )
+        for attribute in entity.attributes
     )
+    composite_id_assignment = ""
+    if entity.is_composite_id:
+        id_arguments = ", ".join(
+            f"request.{getter_name(attribute)}()" for attribute in entity.pk_attributes
+        )
+        composite_id_assignment = (
+            f"        {model_var}.setId(new {entity.composite_id_class_name}({id_arguments}));"
+        )
+
+    relationship_assignments = []
+    for relationship in mapped_relationships:
+        repository_var = f"{relationship.field_name}Repository"
+        request_getter = f"get{relationship.maps_id[:1].upper()}{relationship.maps_id[1:]}"
+        setter = f"set{relationship.field_name[:1].upper()}{relationship.field_name[1:]}"
+        relationship_assignments.extend(
+            [
+                f"        {model_var}.{setter}(",
+                f"                {repository_var}.findById(request.{request_getter}())",
+                "                        .orElseThrow(() -> new ResourceNotFoundException(",
+                f'                                "{relationship.target_class_name} no encontrado")));',
+            ]
+        )
+
+    dependency_fields = [f"    private final {entity.class_name}Repository {repo_var};"]
+    constructor_parameters = [f"{entity.class_name}Repository {repo_var}"]
+    constructor_assignments = [f"        this.{repo_var} = {repo_var};"]
+    extra_imports: list[str] = []
+    if entity.is_composite_id:
+        extra_imports.append(
+            f"import {base_package}.models.{entity.composite_id_class_name};"
+        )
+    for relationship in mapped_relationships:
+        repository_var = f"{relationship.field_name}Repository"
+        dependency_fields.append(
+            f"    private final {relationship.target_class_name}Repository {repository_var};"
+        )
+        constructor_parameters.append(
+            f"{relationship.target_class_name}Repository {repository_var}"
+        )
+        constructor_assignments.append(f"        this.{repository_var} = {repository_var};")
+        extra_imports.append(
+            f"import {base_package}.repositories.{relationship.target_class_name}Repository;"
+        )
+
+    create_assignments = [
+        *([composite_id_assignment] if composite_id_assignment else []),
+        *relationship_assignments,
+        *create_attribute_assignments,
+    ]
+    # Una clave compuesta identifica al recurso y no debe cambiarse durante PUT.
+    # Las relaciones @MapsId se conservan a partir de la entidad ya recuperada.
+    update_assignments = update_attribute_assignments
 
     content = f"""package {base_package}.services;
 
@@ -555,6 +965,7 @@ import {base_package}.dto.{entity.class_name}Response;
 import {base_package}.exceptions.ResourceNotFoundException;
 import {base_package}.models.{entity.class_name};
 import {base_package}.repositories.{entity.class_name}Repository;
+{chr(10).join(sorted(set(extra_imports)))}
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -562,10 +973,10 @@ import java.util.List;
 @Service
 public class {entity.class_name}Service {{
 
-    private final {entity.class_name}Repository {repo_var};
+{chr(10).join(dependency_fields)}
 
-    public {entity.class_name}Service({entity.class_name}Repository {repo_var}) {{
-        this.{repo_var} = {repo_var};
+    public {entity.class_name}Service({', '.join(constructor_parameters)}) {{
+{chr(10).join(constructor_assignments)}
     }}
 
     public List<{entity.class_name}Response> listar() {{
@@ -581,13 +992,13 @@ public class {entity.class_name}Service {{
 
     public {entity.class_name}Response crear({entity.class_name}Request request) {{
         {entity.class_name} {model_var} = new {entity.class_name}();
-{chr(10).join(request_assignments) if request_assignments else "        // No hay campos editables definidos."}
+{chr(10).join(create_assignments) if create_assignments else "        // No hay campos editables definidos."}
         return toResponse({repo_var}.save({model_var}));
     }}
 
     public {entity.class_name}Response actualizar({entity.id_attribute.java_type} id, {entity.class_name}Request request) {{
         {entity.class_name} {model_var} = obtenerEntidad(id);
-{chr(10).join(request_assignments) if request_assignments else "        // No hay campos editables definidos."}
+{chr(10).join(update_assignments) if update_assignments else "        // No hay campos editables definidos."}
         return toResponse({repo_var}.save({model_var}));
     }}
 
@@ -618,11 +1029,30 @@ def generate_controller(base_package: str, entity: Entity) -> GeneratedFile:
     """Genera el controller REST con endpoints CRUD."""
 
     service_var = f"{entity.variable_name}Service"
+    model_import = ""
+    if entity.is_composite_id:
+        model_import = f"import {base_package}.models.{entity.composite_id_class_name};"
+        id_path = "/" + "/".join(
+            f"{{{attribute.java_name}}}" for attribute in entity.pk_attributes
+        )
+        id_parameters = ",\n            ".join(
+            f'@PathVariable("{attribute.java_name}") {attribute.java_type} {attribute.java_name}'
+            for attribute in entity.pk_attributes
+        )
+        id_expression = (
+            f"new {entity.composite_id_class_name}"
+            f"({', '.join(attribute.java_name for attribute in entity.pk_attributes)})"
+        )
+    else:
+        id_path = "/{id}"
+        id_parameters = f"@PathVariable {entity.id_attribute.java_type} id"
+        id_expression = "id"
 
     content = f"""package {base_package}.controllers;
 
 import {base_package}.dto.{entity.class_name}Request;
 import {base_package}.dto.{entity.class_name}Response;
+{model_import}
 import {base_package}.services.{entity.class_name}Service;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -646,9 +1076,11 @@ public class {entity.class_name}Controller {{
         return ResponseEntity.ok({service_var}.listar());
     }}
 
-    @GetMapping("/{{id}}")
-    public ResponseEntity<{entity.class_name}Response> buscarPorId(@PathVariable {entity.id_attribute.java_type} id) {{
-        return ResponseEntity.ok({service_var}.buscarPorId(id));
+    @GetMapping("{id_path}")
+    public ResponseEntity<{entity.class_name}Response> buscarPorId(
+            {id_parameters}
+    ) {{
+        return ResponseEntity.ok({service_var}.buscarPorId({id_expression}));
     }}
 
     @PostMapping
@@ -656,17 +1088,19 @@ public class {entity.class_name}Controller {{
         return ResponseEntity.status(HttpStatus.CREATED).body({service_var}.crear(request));
     }}
 
-    @PutMapping("/{{id}}")
+    @PutMapping("{id_path}")
     public ResponseEntity<{entity.class_name}Response> actualizar(
-            @PathVariable {entity.id_attribute.java_type} id,
+            {id_parameters},
             @Valid @RequestBody {entity.class_name}Request request
     ) {{
-        return ResponseEntity.ok({service_var}.actualizar(id, request));
+        return ResponseEntity.ok({service_var}.actualizar({id_expression}, request));
     }}
 
-    @DeleteMapping("/{{id}}")
-    public ResponseEntity<Void> eliminar(@PathVariable {entity.id_attribute.java_type} id) {{
-        {service_var}.eliminar(id);
+    @DeleteMapping("{id_path}")
+    public ResponseEntity<Void> eliminar(
+            {id_parameters}
+    ) {{
+        {service_var}.eliminar({id_expression});
         return ResponseEntity.noContent().build();
     }}
 }}
@@ -719,11 +1153,24 @@ def generate_backend_metadata_controller(
             {
                 "nombre": entity.name,
                 "endpoint": f"/api/{entity.route_name}",
+                "rutaDetalle": (
+                    f"/api/{entity.route_name}/"
+                    + "/".join(f"{{{attribute.java_name}}}" for attribute in entity.pk_attributes)
+                    if entity.is_composite_id
+                    else f"/api/{entity.route_name}/{{id}}"
+                ),
                 "id": {
                     "nombre": entity.id_attribute.java_name,
                     "type": map_schema_type(entity.id_attribute.java_type),
                     "generado": entity.generated_id,
                     "compuesto": entity.is_composite_id,
+                    "campos": [
+                        {
+                            "nombre": attribute.java_name,
+                            "type": map_schema_type(attribute.java_type),
+                        }
+                        for attribute in entity.pk_attributes
+                    ],
                 },
                 "atributos": {
                     attribute.java_name: {
@@ -739,6 +1186,18 @@ def generate_backend_metadata_controller(
                     "OBTENER",
                     "ACTUALIZAR",
                     "ELIMINAR",
+                ],
+                "heredaDe": entity.parent_class_name,
+                "relaciones": [
+                    {
+                        "campo": relationship.field_name,
+                        "destino": relationship.target_class_name,
+                        "tipoUml": relationship.relation_type,
+                        "tipoJpa": relationship.annotation,
+                        "sourceCardinality": relationship.source_cardinality,
+                        "targetCardinality": relationship.target_cardinality,
+                    }
+                    for relationship in entity.relationships
                 ],
             }
             for entity in entities
@@ -787,7 +1246,205 @@ public class BackendMetadataController {{
     )
 
 
-def generate_common_files(base_package: str, project_name: str, database_name: str) -> list[GeneratedFile]:
+def json_example_value(java_type: str) -> Any:
+    """Devuelve un valor JSON representativo para documentar un tipo Java."""
+
+    examples: dict[str, Any] = {
+        "Long": 1,
+        "Integer": 1,
+        "Double": 10.5,
+        "Float": 10.5,
+        "BigDecimal": 10.5,
+        "Boolean": True,
+        "LocalDate": "2026-09-23",
+        "LocalDateTime": "2026-09-23T12:00:00",
+    }
+    return examples.get(java_type, "ejemplo")
+
+
+def request_attributes(entity: Entity) -> list[Attribute]:
+    """Replica los campos que expone el DTO Request de una entidad."""
+
+    return [
+        attribute
+        for attribute in entity.attributes
+        if not attribute.primary_key or entity.is_composite_id or not entity.generated_id
+    ]
+
+
+def entity_route_template(entity: Entity) -> str:
+    """Construye la ruta de detalle tal como la publica el controller."""
+
+    base_route = f"/api/{entity.route_name}"
+    if entity.is_composite_id:
+        identifiers = "/".join(
+            f"{{{attribute.java_name}}}" for attribute in entity.pk_attributes
+        )
+        return f"{base_route}/{identifiers}"
+    return f"{base_route}/{{id}}"
+
+
+def generate_readme(
+    project_name: str,
+    database_name: str,
+    entities: list[Entity],
+) -> str:
+    """Documenta instalacion, variables, rutas y cuerpos JSON del backend."""
+
+    endpoint_rows = [
+        "| Metodo | Ruta | Descripcion |",
+        "|---|---|---|",
+        "| GET | `/api/health` | Comprobar que el backend esta activo |",
+        "| GET | `/api/schema` | Obtener metadatos de entidades y campos |",
+    ]
+    example_sections: list[str] = []
+
+    for entity in entities:
+        collection_route = f"/api/{entity.route_name}"
+        detail_route = entity_route_template(entity)
+        endpoint_rows.extend(
+            [
+                f"| GET | `{collection_route}` | Listar {entity.name} |",
+                f"| GET | `{detail_route}` | Obtener {entity.name} por id |",
+                f"| POST | `{collection_route}` | Crear {entity.name} |",
+                f"| PUT | `{detail_route}` | Actualizar {entity.name} |",
+                f"| DELETE | `{detail_route}` | Eliminar {entity.name} |",
+            ]
+        )
+
+        request_body = {
+            attribute.java_name: json_example_value(attribute.java_type)
+            for attribute in request_attributes(entity)
+        }
+        request_json = json.dumps(request_body, ensure_ascii=False, indent=2)
+        example_sections.append(
+            "\n".join(
+                [
+                    f"### {entity.name}",
+                    "",
+                    f"Crear: `POST {collection_route}`",
+                    "",
+                    "Actualizar: `PUT " + detail_route + "`",
+                    "",
+                    "Para ambas operaciones usa `Content-Type: application/json` y este cuerpo:",
+                    "",
+                    "```json",
+                    request_json,
+                    "```",
+                ]
+            )
+        )
+
+    routes = "\n".join(endpoint_rows)
+    examples = "\n\n".join(example_sections) or (
+        "El diagrama no contiene entidades, por lo que no se generaron rutas CRUD."
+    )
+
+    return f"""# {project_name}
+
+Backend Spring Boot generado por DrawSchemaAI a partir del diagrama de clases.
+
+## Requisitos
+
+- Java 17 o superior
+- Maven 3.9 o superior
+- PostgreSQL
+
+Comprueba la instalacion:
+
+```powershell
+java -version
+mvn -version
+```
+
+## Base de datos
+
+Ejecuta el archivo `database.sql` o crea la base manualmente:
+
+```sql
+CREATE DATABASE {database_name};
+```
+
+La conexion acepta variables de entorno. Estos son sus valores predeterminados:
+
+| Variable | Valor predeterminado |
+|---|---|
+| `DB_URL` | `jdbc:postgresql://localhost:5432/{database_name}` |
+| `DB_USERNAME` | `postgres` |
+| `DB_PASSWORD` | `postgres` |
+| `SERVER_PORT` | `8086` |
+
+Ejemplo para PowerShell si tu configuracion es diferente:
+
+```powershell
+$env:DB_URL="jdbc:postgresql://localhost:5432/{database_name}"
+$env:DB_USERNAME="postgres"
+$env:DB_PASSWORD="tu_password"
+$env:SERVER_PORT="8086"
+```
+
+No guardes passwords reales dentro de `application.properties` ni los subas a Git.
+
+## Ejecutar
+
+Desde la carpeta raiz del proyecto:
+
+```powershell
+mvn spring-boot:run
+```
+
+Tambien puedes compilar y ejecutar el JAR:
+
+```powershell
+mvn clean package
+java -jar target/{project_name}-0.0.1-SNAPSHOT.jar
+```
+
+La URL base local es `http://localhost:8086`. Prueba primero:
+
+```http
+GET http://localhost:8086/api/health
+```
+
+## Rutas REST
+
+{routes}
+
+En las rutas de detalle sustituye `{{id}}` y los identificadores compuestos por valores reales.
+
+## JSON para Postman
+
+En Postman selecciona **Body > raw > JSON** para peticiones `POST` y `PUT`.
+
+{examples}
+
+## Respuestas y errores
+
+- `200 OK`: consulta o actualizacion correcta.
+- `201 Created`: recurso creado.
+- `204 No Content`: recurso eliminado.
+- `400 Bad Request`: JSON o validacion incorrecta.
+- `404 Not Found`: no existe el id solicitado.
+
+Ejemplo de error de validacion:
+
+```json
+{{
+  "timestamp": "2026-09-23T12:00:00",
+  "status": 400,
+  "message": "Error de validacion",
+  "errors": ["nombre: no debe estar vacio"]
+}}
+```
+"""
+
+
+def generate_common_files(
+    base_package: str,
+    project_name: str,
+    database_name: str,
+    entities: list[Entity],
+) -> list[GeneratedFile]:
     """Genera archivos comunes: pom.xml, properties, README, SQL, CORS y errores."""
 
     project_literal = json.dumps(project_name, ensure_ascii=False)
@@ -812,6 +1469,7 @@ def generate_common_files(base_package: str, project_name: str, database_name: s
 
     <properties>
         <java.version>17</java.version>
+        <lombok.version>1.18.48</lombok.version>
     </properties>
 
     <dependencies>
@@ -835,6 +1493,7 @@ def generate_common_files(base_package: str, project_name: str, database_name: s
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
+            <version>${{lombok.version}}</version>
             <optional>true</optional>
         </dependency>
         <dependency>
@@ -847,6 +1506,20 @@ def generate_common_files(base_package: str, project_name: str, database_name: s
     <build>
         <plugins>
             <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>${{lombok.version}}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+            <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
@@ -856,9 +1529,9 @@ def generate_common_files(base_package: str, project_name: str, database_name: s
 """
 
     properties = f"""spring.application.name={project_name}
-spring.datasource.url=jdbc:postgresql://localhost:5432/{database_name}
-spring.datasource.username=postgres
-spring.datasource.password=postgres
+spring.datasource.url=${{DB_URL:jdbc:postgresql://localhost:5432/{database_name}}}
+spring.datasource.username=${{DB_USERNAME:postgres}}
+spring.datasource.password=${{DB_PASSWORD:postgres}}
 
 spring.jpa.hibernate.ddl-auto=update
 spring.jpa.show-sql=true
@@ -872,36 +1545,7 @@ drawschema.discovery.enabled=true
 
     database_sql = f"CREATE DATABASE {database_name};\n"
 
-    readme = f"""# {project_name}
-
-Backend Spring Boot generado por DrawSchemaAI.
-
-## Requisitos
-
-- Java 17 o superior
-- Maven
-- PostgreSQL
-
-## Crear base de datos
-
-```sql
-CREATE DATABASE {database_name};
-```
-
-## Configurar conexion
-
-Edita `src/main/resources/application.properties` si tu usuario o password de PostgreSQL son distintos.
-
-## Ejecutar
-
-```bash
-mvn spring-boot:run
-```
-
-## Endpoints
-
-Los controladores generados exponen rutas REST bajo `/api`.
-"""
+    readme = generate_readme(project_name, database_name, entities)
 
     resource_not_found = f"""package {base_package}.exceptions;
 
@@ -1119,7 +1763,7 @@ def build_spring_boot_project(
     entities, warnings = parse_entities(context)
     files: list[GeneratedFile] = []
 
-    files.extend(generate_common_files(base_package, project_name, database_name))
+    files.extend(generate_common_files(base_package, project_name, database_name, entities))
     files.append(generate_application(base_package, project_name))
     files.append(generate_backend_metadata_controller(base_package, project_name, entities))
 

@@ -45,6 +45,10 @@ Reglas generales:
 - Si una relacion apunta a clases inexistentes, genera error.
 - Si hay relaciones duplicadas del mismo tipo entre las mismas clases, genera error.
 - Si hay cardinalidades fuera de 1, 0..1, 0..*, 1..*, genera error.
+- Si una generalization tiene cardinalidades, genera warning y recomienda
+  eliminarlas: la herencia no usa multiplicidad.
+- Si una composition tiene sourceCardinality 0..* o 1..*, genera error: cada
+  Parte puede pertenecer como maximo a un Todo.
 - Si una clase tipo Detalle, Item o Linea no tiene composicion con su clase principal, genera warning.
 - Si una composicion parece invertida, genera warning o error.
 - Si una herencia no representa una relacion "es un", genera warning.
@@ -65,6 +69,7 @@ targetClassId es la clase padre.
 Debe representar "la clase hija es un tipo de la clase padre".
 No debe ser recursiva.
 No debe generar ciclos.
+No lleva sourceCardinality ni targetCardinality.
 
 3. Composition:
 sourceClassId es el Todo.
@@ -74,11 +79,14 @@ Ejemplo correcto:
 Venta -> DetalleVenta.
 Factura -> DetalleFactura.
 Pedido -> ItemPedido.
+sourceCardinality (extremo del Todo) debe ser 1 o 0..1.
+targetCardinality indica cuantas Partes puede contener cada Todo.
 
 4. Aggregation:
 sourceClassId es el Todo debil.
 targetClassId es la Parte.
 La Parte puede existir sin el Todo.
+Puede conservar multiplicidad en ambos extremos y no implica borrado en cascada.
 
 5. Association Class:
 Debe usarse cuando una relacion necesita atributos propios.

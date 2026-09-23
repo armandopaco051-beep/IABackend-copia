@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     SUGGESTION_MODEL: str = "gemini/gemini-3.6-flash"
     VALIDATION_MODEL: str = "gemini/gemini-3.6-flash"
     CODEGEN_MODEL: str = "gemini/gemini-3.6-flash"
+    IMAGE_MODEL: str = "gemini/gemini-3.5-flash"
+    IMAGE_FALLBACK_MODELS: str = "gemini/gemini-3.6-flash"
+
+    IMAGE_MAX_BYTES: int = 10 * 1024 * 1024
 
     BACKEND_API_URL: str = "http://127.0.0.1:8001"
     FRONTEND_URL: str = "http://localhost:5173"

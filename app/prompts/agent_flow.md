@@ -15,6 +15,7 @@ Cada agente puede usar un modelo diferente desde `.env`.
 - `SUGGESTION_MODEL`
 - `VALIDATION_MODEL`
 - `CODEGEN_MODEL`
+- `IMAGE_MODEL`
 
 El archivo `app/config/agents_models.py` centraliza esa configuracion.
 El archivo `app/providers/ai_provider.py` centraliza el proveedor de IA.
@@ -41,13 +42,38 @@ Salida:
 
 ## Diagram Agent
 
-Responsabilidad futura:
+Responsabilidad:
 - Ejecutar el plan aprobado usando endpoints del backend principal.
 
 Validaciones:
 - Token presente.
 - El backend principal valida permisos.
 - No modificar JSONB directamente.
+
+## Image Agent
+
+Responsabilidad:
+- Leer imagenes PNG, JPEG o WebP de diagramas UML, ER o bocetos.
+- Extraer clases/tablas, atributos, metodos, relaciones y multiplicidades.
+- Comparar la extraccion con el diagrama actual y producir acciones ejecutables
+  que el frontend aplica directamente a la pizarra.
+- Reconocer una clase de asociacion como una tercera clase conectada por linea
+  discontinua al centro de la asociacion principal, sin crear edges auxiliares.
+
+Validaciones:
+- Maximo 10 MB y firma binaria de imagen valida.
+- Cardinalidades limitadas a `1`, `0..1`, `0..*` y `1..*`.
+- Generalization no lleva cardinalidades.
+- Aggregation y composition conservan multiplicidades en ambos extremos.
+- En composition, `sourceCardinality` es `1` o `0..1` porque la Parte solo
+  puede pertenecer a un Todo.
+- Una cardinalidad ilegible en una relacion que la necesita genera una pregunta
+  y esa relacion no se ejecuta automaticamente.
+- Las relaciones deben apuntar a clases extraidas o existentes.
+- El rol visualizador puede analizar, pero no ejecutar cambios.
+
+Endpoint:
+- `POST /ai/image/analyze` con `multipart/form-data`.
 
 ## Suggestion Agent
 

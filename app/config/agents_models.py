@@ -8,6 +8,7 @@ def get_agent_model_name(agent_name: str):
         "suggestion": settings.SUGGESTION_MODEL,
         "validation": settings.VALIDATION_MODEL,
         "codegen": settings.CODEGEN_MODEL,
+        "image": settings.IMAGE_MODEL,
     }
 
     try:

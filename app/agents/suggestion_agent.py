@@ -47,6 +47,9 @@ Cardinalidades permitidas:
 - 0..*
 - 1..*
 
+Las cardinalidades se aplican a association, associationClass, aggregation y
+composition. Generalization no lleva cardinalidades.
+
 Criterios para sugerir relaciones:
 
 1. Association:
@@ -62,6 +65,7 @@ Administrador es un Usuario.
 Empleado es una Persona.
 sourceName es la clase hija.
 targetName es la clase padre.
+No incluyas sourceCardinality ni targetCardinality.
 
 3. Composition:
 Usala cuando una clase contiene partes que no tienen sentido existir sin el todo.
@@ -71,6 +75,8 @@ Factura contiene DetalleFactura.
 Pedido contiene ItemPedido.
 sourceName es el Todo.
 targetName es la Parte.
+La Parte pertenece como maximo a un Todo: sourceCardinality debe ser 1 o 0..1.
+targetCardinality expresa cuantas Partes tiene cada Todo.
 
 4. Aggregation:
 Usala cuando una clase agrupa otras, pero las partes pueden existir por separado.
@@ -78,6 +84,8 @@ Ejemplo:
 Curso tiene Estudiantes.
 Departamento tiene Empleados.
 Equipo tiene Jugadores.
+sourceName es el Todo debil y targetName es la Parte. Conserva las
+multiplicidades de ambos extremos; una Parte puede compartirse.
 
 5. Association Class:
 Usala cuando una relacion necesita atributos propios.
