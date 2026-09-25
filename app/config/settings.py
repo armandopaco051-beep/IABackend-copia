@@ -17,8 +17,8 @@ class Settings(BaseSettings):
 
     IMAGE_MAX_BYTES: int = 10 * 1024 * 1024
 
-    BACKEND_API_URL: str = "http://127.0.0.1:8001"
-    FRONTEND_URL: str = "http://localhost:5173"
+    BACKEND_API_URL: str = "https://backendcopia-software.onrender.com/docs"
+    FRONTEND_URL: str = "https://frontend-copia-software.vercel.app"
 
     model_config = SettingsConfigDict(
         env_file=".env",

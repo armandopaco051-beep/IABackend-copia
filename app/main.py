@@ -36,6 +36,7 @@ app.add_middleware(
         settings.FRONTEND_URL,
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://frontend-copia-software.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
