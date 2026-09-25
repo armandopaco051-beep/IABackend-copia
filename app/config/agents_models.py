@@ -26,21 +26,17 @@ def normalize_litellm_model(model_name: str):
 
 
 def get_litellm_api_key(model_name: str):
-    if model_name.startswith("gemini/") or model_name.startswith("vertex_ai/"):
+    if model_name.startswith("gemini/"):
         return settings.GEMINI_API_KEY
 
-    if model_name.startswith("openai/"):
-        return settings.OPENAI_API_KEY
-
-    return None
+    raise ValueError(
+        f"Modelo no soportado: {model_name}. Configura un modelo con prefijo gemini/"
+    )
 
 
 def get_agent_model(agent_name: str):
     provider = settings.AI_PROVIDER.strip().lower()
     model_name = get_agent_model_name(agent_name)
-
-    if provider == "openai":
-        return model_name
 
     if provider == "litellm":
         from agents.extensions.models.litellm_model import LitellmModel
@@ -53,4 +49,6 @@ def get_agent_model(agent_name: str):
             base_url=settings.LITELLM_API_BASE,
         )
 
-    raise ValueError(f"Proveedor IA no soportado: {settings.AI_PROVIDER}")
+    raise ValueError(
+        "Este servicio solo admite AI_PROVIDER=litellm para utilizar Gemini"
+    )

@@ -40,7 +40,7 @@ mcp==2.2.0
 mcp-types==2.2.0
 multidict==6.8.0
 openai==2.54.0
-openai-agents==0.22.2
+openai-agents==0.20.0
 opentelemetry-api==1.44.0
 packaging==26.3
 propcache==0.5.2

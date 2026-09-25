@@ -2,7 +2,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    OPENAI_API_KEY: str | None = None
     GEMINI_API_KEY: str | None = None
     LITELLM_API_BASE: str | None = None
 
