@@ -101,10 +101,13 @@ class WorkerRelay:
 
     async def infer(self, path, body):
         validate_payload(path, body)
-        choices = [w for w in self.workers.values() if self.active(w) and w.model == settings.OLLAMA_MODEL
-                   and w.waiting < settings.OLLAMA_WORKER_MAX_PENDING]
-        if not choices:
+        available = [w for w in self.workers.values() if self.active(w) and w.model == settings.OLLAMA_MODEL]
+        if not available:
             raise WorkerRelayError("No hay un worker local disponible. Enciende Ollama y ejecuta el worker en tu PC.")
+        choices = [w for w in available if w.waiting < settings.OLLAMA_WORKER_MAX_PENDING]
+        if not choices:
+            raise WorkerRelayError("La cola de IA local está llena. Espera a que termine alguna consulta y reintenta.",
+                                   "LOCAL_QUEUE_FULL", 429)
         connection = min(choices, key=lambda w: w.waiting)
         connection.waiting += 1
         request_id = str(uuid4())
