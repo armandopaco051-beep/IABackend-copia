@@ -4,6 +4,16 @@ import unicodedata
 from app.schemas.chat import PlannerResponse
 
 
+CLASS_NAME_PREFIX = (
+    r"\b(?:clase|tabla|entidad)\s+(?:(?:de(?!\s+nombre\b)|la|el|una|un|nueva|nuevo)\s+)*"
+    r"(?:(?:llamad[ao]|nombrad[ao]|denominad[ao]|de\s+nombre|con\s+(?:el\s+)?nombre(?:\s+de)?)\s*:?\s+)?"
+)
+CLASS_NAME_REFERENCE = re.compile(
+    CLASS_NAME_PREFIX + r"""(?:["'\x60«“]([^"'\x60»”\r\n]+)["'\x60»”]|([^\W\d][\w-]*))""",
+    re.IGNORECASE,
+)
+
+
 def normalized(value):
     value = unicodedata.normalize("NFKD", str(value)).casefold()
     return "".join(c for c in value if c.isalnum() and not unicodedata.combining(c))
@@ -18,11 +28,11 @@ def grounding_issues(message: str, plan: PlannerResponse, context: dict | None):
     names = {normalized((n.get("data") or {}).get("name", "")) for n in content.get("nodes", [])}
     names_by_id = {str(n.get("id")): normalized((n.get("data") or {}).get("name", "")) for n in content.get("nodes", [])}
     explicit = {
-        normalized(name) for name in re.findall(
-            r"\b(?:clase|tabla|entidad)\s+(?:(?:de|la|el|una|un)\s+)*[\"'`]?([^\W\d]\w*)",
-            message, re.IGNORECASE,
-        )
-    } - {"que", "con", "actual", "existente", "nueva", "intermedia", "asociacion"}
+        normalized(quoted or plain) for quoted, plain in CLASS_NAME_REFERENCE.findall(message)
+    } - {"que", "con", "actual", "existente", "nueva", "intermedia", "asociacion",
+         "llamada", "nombrada", "denominada", "nombre"}
+    # If a complete referenced name exists, a similarly prefixed class is a different target.
+    exact_existing = explicit & names
     association_names = {
         normalized(a.arguments.get("associationClassName", ""))
         for a in plan.actions if a.tool in {"create_relation", "update_relation"}
@@ -43,7 +53,7 @@ def grounding_issues(message: str, plan: PlannerResponse, context: dict | None):
         if action.tool in {"update_class", "delete_class", "move_class"}:
             target = normalized(args.get("className", "")) or names_by_id.get(str(args.get("classId", "")), "")
             if target and explicit and not any(
-                target == item or target.startswith(item) or item.startswith(target) for item in explicit
+                target == item or (item not in exact_existing and target.startswith(item)) for item in explicit
             ):
                 issues.append("La acción modifica una clase diferente de la nombrada en la petición actual.")
         if action.tool == "create_class":

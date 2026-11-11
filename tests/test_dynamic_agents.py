@@ -26,6 +26,16 @@ class DynamicGroundingTest(unittest.TestCase):
         self.assertTrue(grounding_issues("pero y la clase venta?", plan("Cliente"), {}))
         self.assertFalse(grounding_issues("pero y la clase venta?", plan("Venta"), {}))
 
+    def test_named_class_uses_name_after_introducer(self):
+        requests = (
+            "@ia crea una clase llamada users, que contenga los atributos: id como pk, nombre como string, aplliido como string",
+            "Crea una tabla con el nombre de «users»",
+        )
+        for request in requests:
+            with self.subTest(request=request):
+                self.assertEqual(grounding_issues(request, plan("users"), {}), [])
+                self.assertTrue(grounding_issues(request, plan("Cliente"), {}))
+
     def test_empty_answer_about_old_class_is_not_a_valid_followup(self):
         stale = PlannerResponse(intent="modify_diagram", summary="Revisar la clase Cliente", can_execute=True)
         self.assertTrue(grounding_issues("pero y la clase venta?", stale, {}))
@@ -33,6 +43,19 @@ class DynamicGroundingTest(unittest.TestCase):
     def test_rejects_duplicate_class_from_actual_diagram(self):
         context = {"diagrama": {"contenido": {"nodes": [{"id": "x", "data": {"name": "Reserva"}}]}}}
         self.assertTrue(grounding_issues("agrega clase Reserva", plan("Reserva"), context))
+
+    def test_quoted_multiword_names_and_exact_existing_targets(self):
+        request = 'Incorpora una entidad de nombre «Detalle Venta»'
+        self.assertFalse(grounding_issues(request, plan("Detalle Venta"), {}))
+        self.assertTrue(grounding_issues(request, plan("Detalle Compra"), {}))
+        context = {"diagrama": {"contenido": {"nodes": [
+            {"id": "a", "data": {"name": "Cliente"}},
+            {"id": "b", "data": {"name": "Cliente Premium"}},
+        ]}}}
+        wrong = PlannerResponse(intent="modify_diagram", summary="Propuesta", actions=[
+            PlannerAction(order=1, tool="delete_class", description="Eliminar", arguments={"classId": "b"}),
+        ])
+        self.assertTrue(grounding_issues("Suprime la tabla Cliente", wrong, context))
 
 
 class OrchestrationTest(unittest.IsolatedAsyncioTestCase):
@@ -68,3 +91,30 @@ class OrchestrationTest(unittest.IsolatedAsyncioTestCase):
         await run_chat("Valida el diagrama", {})
         validation.assert_awaited_once()
         suggestion.assert_not_awaited()
+
+    @patch("app.services.chat_orchestrator.run_validation", new_callable=AsyncMock)
+    @patch("app.services.chat_orchestrator.run_suggestion", new_callable=AsyncMock)
+    @patch("app.services.chat_orchestrator.run_planner", new_callable=AsyncMock)
+    async def test_colloquial_review_and_suggestions_reach_specialists(self, planner, suggestion, validation):
+        context = {"diagrama": {"id": 8}}
+        validation.return_value = ValidationResponse(summary="Revisión", valid=True, score=90)
+        suggestion.return_value = SuggestionResponse(summary="Mejoras")
+        for message, intent in (
+            ("@IA ¿Ves algo raro en mi diagrama?", "validate_model"),
+            ("¿Están bien estas relaciones?", "validate_model"),
+            ("¿Qué le falta a este modelo?", "suggest_model"),
+            ("¿Cómo podría mejorar mi diseño?", "suggest_model"),
+        ):
+            with self.subTest(message=message):
+                result = await run_chat(message, context)
+                self.assertEqual(result.intent, intent)
+                self.assertFalse(result.can_execute)
+                self.assertEqual(result.actions, [])
+        self.assertEqual(validation.await_count, 2)
+        self.assertEqual(suggestion.await_count, 2)
+        planner.assert_not_awaited()
+
+        planner.return_value = plan("Pedido")
+        result = await run_chat("Revisa mi diagrama y agrega la clase Pedido", context)
+        self.assertEqual(result.actions[0].tool, "create_class")
+        planner.assert_awaited_once()

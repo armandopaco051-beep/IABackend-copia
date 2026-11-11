@@ -7,6 +7,7 @@ from typing import Literal
 
 from app.config.settings import settings
 from app.providers.ollama_connection import native_chat
+from app.services.plan_grounding import CLASS_NAME_PREFIX
 from .commands import Interpretation
 from .context import build_local_input
 from .commands import Command, Attribute, Method
@@ -290,11 +291,21 @@ class RelationReplacementExtraction(BaseModel):
     new_participant: str
 
 
+RELATION_VERBS = r"\b(?:relaciona|vincula|conecta|enlaza|une|asocia)(?:me|las?|los?)?\b|\bvuelve a conectar\b"
+RELATION_TERMS = r"\b(?:relacion\w*|asociacion\w*|vinculo\w*|enlace\w*|conexion\w*|herencia|composicion|agregacion|realizacion|muchos a muchos|multiplicidad\w*|cardinalidad\w*)\b"
+RELATION_EDIT_VERBS = r"\b(?:elimina|borra|quita|suprime|remueve|desvincula|desconecta|actualiza|modifica|edita|cambia|reemplaza|sustituye|invierte)\b"
+
+
 def is_relation_request(message):
     text = "".join(c for c in unicodedata.normalize("NFKD", message).casefold() if not unicodedata.combining(c))
-    return (bool(re.search(r"\b(?:relaciona\w*|vincula\w*|conecta\w*|agrega\w*|crea\w*)\b", text))
-            and bool(re.search(r"relacion|asociacion|muchos a muchos|herencia|composicion|agregacion|realizacion", text))
-            and not re.search(r"\b(?:elimina\w*|borra\w*|actualiza\w*|modifica\w*|cambia\w*|sugiere\w*|recomienda\w*)\b", text))
+    if re.search(RELATION_EDIT_VERBS, text) or re.search(
+        r"\b(?:sugiere|recomienda|explica|que es|como funciona|cuando se usa)\b", text,
+    ):
+        return False
+    return bool(re.search(RELATION_VERBS, text) or (
+        re.search(r"\b(?:agrega|crea|anade|incorpora|genera|establece)\b", text)
+        and re.search(RELATION_TERMS, text)
+    ))
 
 
 def explicit_multiplicities(text):
@@ -344,25 +355,29 @@ async def _interpret_request(message: str, context: dict | None, correction: lis
         return Interpretation(intent="validate_model", answer="Revisar consistencia del diagrama actual.")
 
     simple_class_command = re.fullmatch(
-        r"\s*(?:@ia\b[\s,:-]*)?(crea|agrega|añade|elimina|borra|quita)\s+"
+        r"\s*(?:@ia\b[\s,:-]*)?(crea|agrega|añade|incorpora|genera|elimina|borra|quita|suprime|remueve)\s+"
         r"(?:(?:la|una)\s+)?(?:clase|tabla)\s+[\"'«`]?(\w+)[\"'»`]?\s*[.!]?\s*",
         message, re.IGNORECASE,
     )
     if simple_class_command:
         verb, name = simple_class_command.groups()
         if name.casefold() not in {"actual", "existente", "nueva", "intermedia", "puente"}:
-            operation = "delete_class" if verb.casefold() in {"elimina", "borra", "quita"} else "create_class"
+            operation = "delete_class" if verb.casefold() in {"elimina", "borra", "quita", "suprime", "remueve"} else "create_class"
             return Interpretation(intent="modify_diagram", commands=[Command(operation=operation, name=name)])
 
     prompt = build_local_input(message, context)
     system = INSTRUCTIONS
     schema = Interpretation.model_json_schema()
     relation_only = is_relation_request(message)
-    relation_edit = bool(re.search(r"relacion|asociacion|vinculo", text) and re.search(
-        r"\b(?:elimina\w*|borra\w*|actualiza\w*|modifica\w*|cambia\w*|reemplaza\w*|sustituye\w*)\b", text))
-    replacement = relation_edit and bool(re.search(r"relaciona\w*|conecta\w*|vincula\w*|reemplaza\w*|sustituye\w*|en (?:vez|lugar) de|no con", text))
+    relation_edit = bool(
+        re.search(r"\b(?:desvincula|desconecta)\b", text)
+        or (re.search(RELATION_TERMS, text) and re.search(RELATION_EDIT_VERBS, text))
+    )
+    replacement = relation_edit and bool(re.search(RELATION_VERBS, text) or re.search(
+        r"\b(?:reemplaza|sustituye|en (?:vez|lugar) de|no con)\b", text,
+    ))
     class_only = not relation_only and not re.search(r"relacion|asociacion|herencia|plantilla|generica|\bclases\b|\btablas\b", text) and bool(re.search(
-        r"\b(?:agrega\w*|crea\w*|anade\w*|modifica\w*|actualiza\w*|cambia\w*|renombra\w*|elimina\w*|borra\w*|mueve\w*)\b", text))
+        r"\b(?:agrega\w*|crea\w*|anade\w*|incorpora\w*|genera\w*|modifica\w*|edita\w*|actualiza\w*|cambia\w*|renombra\w*|elimina\w*|borra\w*|quita\w*|suprime\w*|remueve\w*|mueve\w*)\b", text))
     if re.search(r"^\s*(?:como (?:puedo|hago|se)|explica\w*|que (?:es|pasa))\b", text.lstrip("¿")):
         class_only = False
     known_target = None
@@ -420,6 +435,7 @@ Conserva el otro participante y la clase intermedia. Los nombres deben venir de 
         prompt = json.dumps({"clases_existentes": names, "peticion_actual": message}, ensure_ascii=False)
         system = """Extrae UNA relación UML de la petición. Devuelve solo el JSON del esquema.
 source y target son las DOS clases participantes del vínculo, NO la clase intermedia.
+"Une", "asocia", "enlaza", "conecta" y "vincula" piden relacionar clases. Clase, tabla y entidad nombran el mismo tipo de nodo. Usa los nombres exactos del diagrama actual.
 Si también pide crear una clase participante que no existe, inclúyela en new_classes con su nombre y atributos pedidos. El programa la creará ANTES de relacionarla.
 No pongas en new_classes las clases existentes ni la clase intermedia de associationClass.
 Si el usuario crea UNA clase y pide relacionarla sin nombrar la otra, y solo hay UNA clase existente, usa esa como el otro extremo.
@@ -441,18 +457,29 @@ No generes acciones ni explicaciones. Los participantes deben existir o estar ex
             normalized = "".join(c for c in unicodedata.normalize("NFKD", name).casefold() if not unicodedata.combining(c))
             return re.escape(normalized)
         mentioned = [name for name in names if name and re.search(r"(?<!\w)" + name_pattern(name) + r"(?!\w)", text)]
-        explicit = [name for name in mentioned if re.search(r"\b(?:clase|tabla|entidad)\s+(?:de\s+)?[\"'`]?" + name_pattern(name) + r"(?!\w)", text)]
+        explicit = [name for name in mentioned if re.search(CLASS_NAME_PREFIX + r"""["'`«“]?""" + name_pattern(name) + r"(?!\w)", text)]
         candidates = explicit or mentioned
         if len(candidates) == 1:
             known_target = candidates[0]
+        current_class = next(
+            (n.get("data") or {} for n in graph.get("nodes", [])
+             if (n.get("data") or {}).get("name") == known_target),
+            {},
+        )
+        current_fields = {
+            key: current_class[key] for key in ("name", "kind", "attributes", "methods")
+            if key in current_class
+        }
         # Las órdenes con destino explícito no necesitan planes históricos:
         # una clase eliminada no debe desplazar la clase nombrada ahora.
         prompt = json.dumps({"diagrama_activo": ((context or {}).get("diagrama") or {}).get("id"),
                              "clases_actuales": names, "destino_identificado": known_target,
+                             "clase_actual": current_fields,
                              "peticion_actual": message}, ensure_ascii=False)
         system = """Extrae el cambio de UNA clase del diagrama. Devuelve solo JSON.
 operation: create_class, update_class, delete_class o move_class.
-En este editor, tabla, entidad y clase se refieren al mismo nodo UML. Crear una tabla usa create_class; eliminar una tabla usa delete_class.
+En este editor, tabla, entidad y clase se refieren al mismo nodo UML. Interpreta sinónimos en contexto: crear, agregar, añadir, incorporar o generar una clase; eliminar, quitar, borrar, suprimir o remover una clase; editar, cambiar o actualizar una clase. Si la orden es sobre un atributo, campo, columna o método, modifica ese elemento dentro de la clase. Usa clase_actual para conocer sus atributos y métodos.
+"Una clase llamada X", "una tabla de nombre X" y "una entidad con el nombre X" tienen como nombre X.
 name es la clase solicitada, new_name solo para renombrarla.
 La orden puede empezar por el destino: "a la clase X agrega el atributo Y" es update_class de X, no crear otra clase.
 Si destino_identificado está informado, úsalo como name. Trabaja con la petición actual; no repitas tareas anteriores.
@@ -545,10 +572,11 @@ Usa únicamente el diagrama actual para afirmar qué elementos existen.
     if class_only:
         command = ClassExtraction.model_validate_json(content)
         if known_target:
-            command.name = known_target
-            if re.search(r"\b(?:agrega\w*|anade\w*|crea\w*|elimina\w*|borra\w*|modifica\w*|actualiza\w*|renombra\w*)\s+(?:(?:el|un|los|unos|la|una|las|unas)\s+)?(?:atributo|campo|metodo)", text):
+            if re.search(r"\b(?:agrega\w*|anade\w*|incorpora\w*|crea\w*|elimina\w*|borra\w*|quita\w*|suprime\w*|remueve\w*|modifica\w*|edita\w*|actualiza\w*|renombra\w*)\s+(?:(?:el|un|los|unos|la|una|las|unas)\s+)?(?:atributo|campo|columna|metodo)", text):
                 command.operation = "update_class"
                 command.new_name = None
+            if command.operation != "create_class":
+                command.name = known_target
         return Interpretation(intent="modify_diagram", commands=[Command(**command.model_dump())])
     if educational:
         if design_generation:
