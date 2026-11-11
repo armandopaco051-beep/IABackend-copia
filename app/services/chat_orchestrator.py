@@ -1,6 +1,7 @@
 from app.agents.planner_agent import run_planner
 from app.agents.suggestion_agent import run_suggestion
 from app.agents.validation_agent import run_validation
+from app.services.diagram_summary import requests_diagram_summary, summarize_diagram
 
 
 def specialist_summary(summary: str, details: list[str], context: dict):
@@ -14,6 +15,10 @@ def specialist_summary(summary: str, details: list[str], context: dict):
 
 async def run_chat(message: str, context: dict):
     """Dispatch by the planner's intent, retaining each specialist's contract."""
+    if requests_diagram_summary(message):
+        summary = summarize_diagram(context)
+        return summary.model_copy(update={"summary": specialist_summary(summary.summary, [], context)})
+
     plan = await run_planner(message, context)
     if plan.intent == "validate_model" and not plan.actions:
         validation = await run_validation(message, context)
