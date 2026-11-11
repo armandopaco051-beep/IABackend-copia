@@ -338,11 +338,26 @@ Para conceptos responde en español de forma útil. No inventes acceso a datos f
 
 
 async def _interpret_request(message: str, context: dict | None, correction: list[str] | None = None):
+    text = "".join(c for c in unicodedata.normalize("NFKD", message).casefold() if not unicodedata.combining(c))
+    intent_text = re.sub(r"^[\s¿¡«»“”\"']*(?:@ia\b[\s,:-]*)?", "", text).lstrip(" \t¿¡«“\"'")
+    if re.match(r"(?:valida|validame|revisa|revisame)\s+(?:este|el|mi|nuestro)\s+(?:diagrama|modelo)\b", intent_text):
+        return Interpretation(intent="validate_model", answer="Revisar consistencia del diagrama actual.")
+
+    simple_class_command = re.fullmatch(
+        r"\s*(?:@ia\b[\s,:-]*)?(crea|agrega|añade|elimina|borra|quita)\s+"
+        r"(?:(?:la|una)\s+)?(?:clase|tabla)\s+[\"'«`]?(\w+)[\"'»`]?\s*[.!]?\s*",
+        message, re.IGNORECASE,
+    )
+    if simple_class_command:
+        verb, name = simple_class_command.groups()
+        if name.casefold() not in {"actual", "existente", "nueva", "intermedia", "puente"}:
+            operation = "delete_class" if verb.casefold() in {"elimina", "borra", "quita"} else "create_class"
+            return Interpretation(intent="modify_diagram", commands=[Command(operation=operation, name=name)])
+
     prompt = build_local_input(message, context)
     system = INSTRUCTIONS
     schema = Interpretation.model_json_schema()
     relation_only = is_relation_request(message)
-    text = "".join(c for c in unicodedata.normalize("NFKD", message).casefold() if not unicodedata.combining(c))
     relation_edit = bool(re.search(r"relacion|asociacion|vinculo", text) and re.search(
         r"\b(?:elimina\w*|borra\w*|actualiza\w*|modifica\w*|cambia\w*|reemplaza\w*|sustituye\w*)\b", text))
     replacement = relation_edit and bool(re.search(r"relaciona\w*|conecta\w*|vincula\w*|reemplaza\w*|sustituye\w*|en (?:vez|lugar) de|no con", text))
@@ -437,6 +452,7 @@ No generes acciones ni explicaciones. Los participantes deben existir o estar ex
                              "peticion_actual": message}, ensure_ascii=False)
         system = """Extrae el cambio de UNA clase del diagrama. Devuelve solo JSON.
 operation: create_class, update_class, delete_class o move_class.
+En este editor, tabla, entidad y clase se refieren al mismo nodo UML. Crear una tabla usa create_class; eliminar una tabla usa delete_class.
 name es la clase solicitada, new_name solo para renombrarla.
 La orden puede empezar por el destino: "a la clase X agrega el atributo Y" es update_class de X, no crear otra clase.
 Si destino_identificado está informado, úsalo como name. Trabaja con la petición actual; no repitas tareas anteriores.
