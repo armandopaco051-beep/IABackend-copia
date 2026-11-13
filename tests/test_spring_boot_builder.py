@@ -119,7 +119,7 @@ class SpringBootBuilderMetadataTest(unittest.TestCase):
         pedido = by_path["src/main/java/com/drawschema/generated/models/Pedido.java"]
 
         self.assertIn(
-            "@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true)", pedido
+            '@OneToMany(mappedBy = "pedido", cascade = CascadeType.ALL, orphanRemoval = true)', pedido
         )
         self.assertIn("private List<DetallePedido> detallePedidos", pedido)
 

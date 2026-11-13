@@ -50,13 +50,14 @@ Reglas generales:
   eliminarlas: la herencia no usa multiplicidad.
 - Si una composition tiene sourceCardinality 0..* o 1..*, genera error: cada
   Parte puede pertenecer como maximo a un Todo.
-- Si una clase tipo Detalle, Item o Linea no tiene composicion con su clase principal, genera warning.
+- Evalúa composición por propiedad exclusiva y ciclo de vida; un nombre como Detalle, Item o Línea no basta para exigirla.
 - Si una composicion parece invertida, genera warning o error.
 - Si una herencia no representa una relacion "es un", genera warning.
 - Si una clase hereda de si misma, genera error.
 - Si detectas ciclo de herencia, genera error.
 - Si detectas ciclo de composicion, genera error.
 - Si una realization apunta a una clase normal y no a una interfaz, genera error.
+- En templateBinding verifica que el destino declare los parámetros y que templateBindings proporcione sus sustituciones. No exige cardinalidades.
 - Si una clase tiene demasiadas responsabilidades, genera warning.
 
 Reglas UML:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,6 +39,9 @@ class Relationship:
     maps_id: str | None = None
     join_column: str | None = None
     target_id_type: str | None = None
+    mapped_by: str | None = None
+    request_field: str | None = None
+    target_id_field: str = "id"
     join_columns: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -60,6 +64,10 @@ class Entity:
     relationships: list[Relationship] = field(default_factory=list)
     parent_class_name: str | None = None
     inheritance_parent: bool = False
+    abstract: bool = False
+    inherited_fields: set[str] = field(default_factory=set)
+    interfaces: list[str] = field(default_factory=list)
+    contract_methods: dict[str, str] = field(default_factory=dict)
 
 
 
@@ -224,13 +232,145 @@ def find_association_key(
     return next((attribute for attribute in candidates if attribute.foreign_key), None)
 
 
+def relation_ends(edge):
+    data = edge.get("data") or {}
+    return tuple(str(data.get(f"{end}ClassId") or edge.get(end) or "") for end in ("source", "target"))
+
+
+def scalar_java_type(raw_type: str) -> str:
+    value = raw_type.strip()
+    java_type = map_java_type(value)
+    if java_type == "String" and not re.fullmatch(r"(?:string|text|varchar|char)(?:\(\d+\))?", value, re.I):
+        raise ValueError(f"Tipo sin mapeo escalar automático: {value}.")
+    return java_type
+
+
+def interface_methods(data):
+    signatures = {}
+    for method in data.get("methods") or []:
+        name = to_camel_case(method.get("name") or "operacion")
+        raw_return = str(method.get("returnType") or "void")
+        return_type = "void" if raw_return.casefold() == "void" else scalar_java_type(raw_return)
+        parameters = []
+        types = []
+        for index, parameter in enumerate(method.get("parameters") or []):
+            if not isinstance(parameter, dict):
+                raise ValueError(f"Define nombre y tipo de los parámetros de {name}.")
+            java_type = scalar_java_type(str(parameter.get("type") or "String"))
+            parameters.append(f"{java_type} {to_camel_case(parameter.get('name') or f'arg{index}')}")
+            types.append(java_type)
+        key = f"{name}({','.join(types)})"
+        if key in signatures:
+            raise ValueError(f"Operación duplicada en la interfaz: {key}.")
+        signatures[key] = f"{return_type} {name}({', '.join(parameters)})"
+    return signatures
+
+
+def generate_interface(base_package, data):
+    name = to_pascal_case(data.get("name") or "Contrato")
+    operations = [f"    {signature};" for signature in interface_methods(data).values()]
+    return GeneratedFile(
+        path=f"src/main/java/{package_path(base_package)}/models/{name}.java",
+        language="java",
+        content="\n".join([
+            f"package {base_package}.models;", "", "import java.math.BigDecimal;",
+            "import java.time.LocalDate;", "import java.time.LocalDateTime;", "",
+            f"public interface {name} {{", *operations, "}", "",
+        ]),
+    )
+
+
+def resolve_generalizations(edges, entities_by_id):
+    parents = {}
+    for edge in edges:
+        if (edge.get("data") or {}).get("relationType") != "generalization":
+            continue
+        child_id, parent_id = relation_ends(edge)
+        if child_id not in entities_by_id or parent_id not in entities_by_id:
+            raise ValueError("La generalización persistente requiere dos clases.")
+        if child_id in parents and parents[child_id] != parent_id:
+            raise ValueError("Java admite una sola clase padre por entidad.")
+        parents[child_id] = parent_id
+
+    order = []
+    visiting = set()
+    resolved = set()
+
+    def visit(child_id):
+        if child_id in visiting:
+            raise ValueError("Hay un ciclo de generalización en el diagrama.")
+        if child_id in resolved or child_id not in parents:
+            return
+        visiting.add(child_id)
+        parent_id = parents[child_id]
+        visit(parent_id)
+        child, parent = entities_by_id[child_id], entities_by_id[parent_id]
+        if child.is_composite_id or parent.is_composite_id:
+            raise ValueError("La generalización con clave compuesta requiere mapeo manual.")
+        child.parent_class_name = parent.class_name
+        parent.inheritance_parent = True
+        child.id_attribute = parent.id_attribute
+        child.generated_id = parent.generated_id
+        child.attributes = [attribute for attribute in child.attributes if not attribute.primary_key]
+        order.append((child, parent))
+        visiting.remove(child_id)
+        resolved.add(child_id)
+
+    for child_id in parents:
+        visit(child_id)
+    return order
+
+
+def expand_templates(nodes, edges):
+    """Materializa sustituciones de tipos escalares en una clase concreta."""
+    templates = {str(n["id"]): n["data"] for n in nodes if (n.get("data") or {}).get("templateParameters")}
+    concrete = [deepcopy(n) for n in nodes if str(n.get("id")) not in templates]
+    by_id = {str(n.get("id")): n for n in concrete}
+    ordinary_edges = []
+    bound = set()
+    warnings = []
+    for edge in edges:
+        data = edge.get("data") or {}
+        source, target = relation_ends(edge)
+        if data.get("relationType") != "templateBinding":
+            if source in templates or target in templates:
+                raise ValueError("Genera relaciones de persistencia sobre las clases concretas, no sobre la plantilla UML.")
+            ordinary_edges.append(edge)
+            continue
+        template = templates.get(target)
+        destination = (by_id.get(source) or {}).get("data")
+        if (not template or destination is None or source in bound
+                or template.get("kind") == "interface" or destination.get("kind") == "interface"):
+            raise ValueError("Template Binding requiere una clase concreta y una plantilla de clase; se admite una plantilla por clase.")
+        parameters = set(template["templateParameters"])
+        substitutions = data.get("templateBindings") or {}
+        if not isinstance(substitutions, dict) or set(substitutions) != parameters:
+            raise ValueError("Completa todos los parámetros de Template Binding con tipos escalares Java o SQL admitidos.")
+        for value in substitutions.values():
+            scalar_java_type(str(value or ""))
+        if template.get("methods"):
+            raise ValueError("La expansión de plantillas con operaciones requiere implementación manual.")
+        own = list(destination.get("attributes") or [])
+        own_names = {to_camel_case(a["name"]) for a in own}
+        inherited = []
+        for attr in template.get("attributes") or []:
+            if to_camel_case(attr["name"]) in own_names:
+                raise ValueError(f"El atributo {attr['name']} está declarado tanto en la plantilla como en la clase concreta.")
+            inherited.append({**attr, "type": substitutions.get(attr.get("type"), attr.get("type"))})
+        destination["attributes"] = inherited + own
+        bound.add(source)
+        warnings.append(f"{destination.get('name')}: plantilla {template.get('name')} materializada con sustituciones escalares.")
+    return concrete, ordinary_edges, warnings
+
+
 def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
     """Lee nodes y edges del JSONB y los transforma en entidades JPA."""
 
     warnings: list[str] = []
     diagrama = context.get("diagrama") or {}
     contenido = diagrama.get("contenido") or {}
-    nodes = contenido.get("nodes") or []
+    nodes, edges, template_warnings = expand_templates(contenido.get("nodes") or [], contenido.get("edges") or [])
+    warnings.extend(template_warnings)
     nodes_by_id = {str(node.get("id")): node for node in nodes}
     entities: list[Entity] = []
     entities_by_node_id: dict[str, Entity] = {}
@@ -238,6 +378,8 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
 
     for index, node in enumerate(nodes):
         data = node.get("data") or {}
+        if data.get("kind") == "interface":
+            continue
         raw_name = str(data.get("name") or f"Entidad{index + 1}")
         class_name = to_pascal_case(raw_name, f"Entity{index + 1}")
 
@@ -338,6 +480,7 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
                 is_composite_id=is_composite_id,
                 composite_id_class_name=composite_id_class_name,
                 pk_attributes=pk_attributes,
+                abstract=data.get("kind") == "abstractClass",
             )
         entities.append(entity)
         entities_by_node_id[entity.node_id] = entity
@@ -346,13 +489,31 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
     if not entities:
         raise ValueError("No se puede generar backend porque el diagrama no tiene clases.")
 
-    for edge in contenido.get("edges") or []:
+    generalizations = resolve_generalizations(edges, entities_by_node_id)
+    for edge in edges:
         data = edge.get("data") or {}
         relation_type = str(data.get("relationType") or "association")
         source_id = str(data.get("sourceClassId") or edge.get("source") or "")
         target_id = str(data.get("targetClassId") or edge.get("target") or "")
         source = entities_by_node_id.get(source_id)
         target = entities_by_node_id.get(target_id)
+
+        if relation_type == "realization":
+            target_data = (nodes_by_id.get(target_id) or {}).get("data") or {}
+            if source is None or target_data.get("kind") != "interface":
+                raise ValueError("La realización debe ir de una clase a una interfaz.")
+            interface_name = to_pascal_case(target_data.get("name") or "Contrato")
+            if interface_name in used_names:
+                raise ValueError(f"El nombre de interfaz {interface_name} coincide con una entidad Java.")
+            if interface_name not in source.interfaces:
+                source.interfaces.append(interface_name)
+            for key, signature in interface_methods(target_data).items():
+                if key in source.contract_methods and source.contract_methods[key] != signature:
+                    raise ValueError(f"Las interfaces de {source.class_name} declaran operaciones incompatibles: {key}.")
+                source.contract_methods[key] = signature
+            if target_data.get("methods"):
+                warnings.append(f"{source.class_name}: completa la lógica de las operaciones de {interface_name}.")
+            continue
 
         if source is None or target is None:
             warnings.append(
@@ -361,17 +522,6 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
             continue
 
         if relation_type == "generalization":
-            source.parent_class_name = target.class_name
-            target.inheritance_parent = True
-            source.id_attribute = target.id_attribute
-            source.generated_id = False
-            source.is_composite_id = False
-            source.composite_id_class_name = None
-            source.pk_attributes = []
-            source.attributes = [
-                target.id_attribute,
-                *[attribute for attribute in source.attributes if not attribute.primary_key],
-            ]
             continue
 
         if relation_type == "associationClass":
@@ -442,30 +592,93 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
             continue
 
         if relation_type not in {"association", "composition", "aggregation"}:
+            warnings.append(f"{relation_type} entre {source.class_name} y {target.class_name}: sin mapeo de persistencia automático.")
             continue
 
         source_cardinality = str(data.get("sourceCardinality") or "1")
         target_cardinality = str(data.get("targetCardinality") or "0..*")
+        source_cardinality = "0..*" if source_cardinality == "*" else source_cardinality
+        target_cardinality = "0..*" if target_cardinality == "*" else target_cardinality
+        if {source_cardinality, target_cardinality} - {"0..1", "1", "0..*", "1..*"}:
+            raise ValueError(f"Multiplicidad sin mapeo en {source.class_name}–{target.class_name}: {source_cardinality} / {target_cardinality}.")
         if relation_type == "composition" and source_cardinality not in {"1", "0..1"}:
             raise ValueError(
                 f"Composicion invalida {source.class_name} -> {target.class_name}: "
                 "una Parte solo puede pertenecer a un Todo (sourceCardinality 1 o 0..1)."
             )
         annotation = relationship_annotation(source_cardinality, target_cardinality)
+        if annotation != "ManyToMany":
+            reverse = annotation == "OneToMany"
+            owner, parent = (target, source) if reverse else (source, target)
+            parent_cardinality = source_cardinality if reverse else target_cardinality
+            children_cardinality = target_cardinality if reverse else source_cardinality
+            role = data.get("sourceRole" if reverse else "targetRole")
+            field_name = unique_relationship_field(owner, to_camel_case(str(role or parent.variable_name)))
+            owner_annotation = "OneToOne" if annotation == "OneToOne" else "ManyToOne"
+            keys = parent.pk_attributes if parent.is_composite_id else [parent.id_attribute]
+            managed_columns = {}
+            for attr in (nodes_by_id[owner.node_id].get("data") or {}).get("attributes") or []:
+                managed = attr.get("_relationshipKey") or {}
+                reference = managed.get("reference") or {}
+                if (managed.get("role") == "many" and str(reference.get("nodeId")) == parent.node_id
+                        and str(managed.get("edgeId")) == str(edge.get("id", ""))
+                        and reference.get("attribute") and attr.get("name")):
+                    managed_columns[to_snake_case(reference["attribute"])] = to_snake_case(attr["name"])
+
+            used_columns = {col for rel in owner.relationships for col, _ in rel.join_columns}
+            used_columns.update(rel.join_column for rel in owner.relationships if rel.join_column)
+            join_columns = []
+            for key in keys:
+                referenced = to_snake_case(key.name)
+                default = f"{to_snake_case(field_name)}_id" if len(keys) == 1 else f"{to_snake_case(field_name)}_{referenced}"
+                conventional = f"id_{to_snake_case(parent.variable_name)}"
+                declared = next((a for a in owner.attributes if a.foreign_key and not a.primary_key
+                                 and to_snake_case(a.name) in {default, conventional}
+                                 and to_snake_case(a.name) not in used_columns), None) if len(keys) == 1 else None
+                column = managed_columns.get(referenced) or (to_snake_case(declared.name) if declared else default)
+                if column in used_columns:
+                    raise ValueError(f"La columna {owner.table_name}.{column} ya corresponde a otro vínculo.")
+                scalar = next((a for a in owner.attributes if to_snake_case(a.name) == column), None)
+                if scalar:
+                    if scalar.primary_key or not scalar.foreign_key or scalar.java_type != key.java_type:
+                        raise ValueError(f"La columna {owner.table_name}.{column} no es compatible con la clave de {parent.class_name}.")
+                    owner.attributes.remove(scalar)
+                join_columns.append((column, referenced))
+
+            request_field = to_camel_case(join_columns[0][0]) if len(keys) == 1 else f"{field_name}Id"
+            if (any(a.java_name == request_field for a in owner.attributes)
+                    or any(r.request_field == request_field for r in owner.relationships)):
+                raise ValueError(f"El campo de referencia {owner.class_name}.{request_field} está duplicado.")
+            owner.relationships.append(Relationship(
+                relation_type, field_name, parent.class_name, parent.table_name,
+                children_cardinality, parent_cardinality, owner_annotation, False,
+                parent_cardinality == "1", target_id_type=parent.id_attribute.java_type,
+                request_field=request_field, join_columns=join_columns,
+                target_id_field=parent.id_attribute.java_name,
+                cascade_all=relation_type == "composition" and owner_annotation == "OneToOne",
+                orphan_removal=relation_type == "composition" and owner_annotation == "OneToOne",
+            ))
+            if owner_annotation == "ManyToOne":
+                inverse_role = str(data.get("targetRole" if reverse else "sourceRole") or owner.variable_name)
+                parent.relationships.append(Relationship(
+                    relation_type, unique_relationship_field(parent, to_camel_case(pluralize(inverse_role))),
+                    owner.class_name, owner.table_name, parent_cardinality, children_cardinality,
+                    "OneToMany", True, children_cardinality == "1..*",
+                    cascade_all=relation_type == "composition", orphan_removal=relation_type == "composition",
+                    mapped_by=field_name,
+                ))
+                if children_cardinality == "1..*":
+                    warnings.append(f"{parent.class_name}–{owner.class_name}: el mínimo de un elemento en la colección requiere validación del flujo de negocio.")
+            elif source_cardinality == "1":
+                warnings.append(f"{source.class_name}–{target.class_name}: el mínimo obligatorio del extremo inverso requiere validación del flujo de negocio.")
+            continue
+
+        warnings.append(f"{source.class_name}–{target.class_name}: para editar el vínculo por REST, modela una clase de asociación.")
         collection = annotation in {"OneToMany", "ManyToMany"}
         role_name = str(data.get("targetRole") or target.variable_name)
         base_field_name = to_camel_case(role_name, target.variable_name)
         if collection and not base_field_name.endswith("s"):
             base_field_name = f"{base_field_name}s"
-
-        join_columns = []
-        if annotation in {"OneToMany", "ManyToOne"}:
-            owner_id, parent_id = (target_id, source_id) if annotation == "OneToMany" else (source_id, target_id)
-            for attr in (nodes_by_id.get(owner_id, {}).get("data") or {}).get("attributes") or []:
-                managed = attr.get("_relationshipKey") or {}
-                reference = managed.get("reference") or {}
-                if managed.get("role") == "many" and str(reference.get("nodeId")) == parent_id and str(managed.get("edgeId")) == str(edge.get("id", "")):
-                    join_columns.append((to_snake_case(attr["name"]), to_snake_case(reference["attribute"])))
 
         source.relationships.append(
             Relationship(
@@ -480,9 +693,15 @@ def parse_entities(context: dict[str, Any]) -> tuple[list[Entity], list[str]]:
                 required=target_cardinality in {"1", "1..*"},
                 cascade_all=relation_type == "composition",
                 orphan_removal=relation_type == "composition" and annotation in {"OneToOne", "OneToMany"},
-                join_columns=join_columns,
             )
         )
+
+    for child, parent in generalizations:
+        inherited = {attribute.java_name for attribute in parent.attributes}
+        if inherited & {attribute.java_name for attribute in child.attributes}:
+            raise ValueError(f"{child.class_name} vuelve a declarar un atributo heredado de {parent.class_name}.")
+        child.inherited_fields = inherited
+        child.attributes = parent.attributes + child.attributes
 
     return entities, warnings
 
@@ -604,6 +823,8 @@ def relationship_field_declaration(entity: Entity, relationship: Relationship) -
     """Genera una propiedad JPA respetando tipo UML, cardinalidad y ciclo de vida."""
 
     options: list[str] = []
+    if relationship.mapped_by:
+        options.append(f'mappedBy = "{relationship.mapped_by}"')
     if relationship.cascade_all:
         options.append("cascade = CascadeType.ALL")
     if relationship.orphan_removal:
@@ -629,13 +850,17 @@ def relationship_field_declaration(entity: Entity, relationship: Relationship) -
                 "    )",
             ]
         )
+    elif relationship.mapped_by:
+        pass
     elif relationship.join_columns:
+        nullable = str(not relationship.required).lower()
+        unique = ", unique = true" if relationship.annotation == "OneToOne" else ""
         if len(relationship.join_columns) == 1:
             column, referenced = relationship.join_columns[0]
-            lines.append(f'    @JoinColumn(name = "{column}", referencedColumnName = "{referenced}")')
+            lines.append(f'    @JoinColumn(name = "{column}", referencedColumnName = "{referenced}", nullable = {nullable}{unique})')
         else:
             lines.append("    @JoinColumns({")
-            lines.append(",\n".join(f'        @JoinColumn(name = "{column}", referencedColumnName = "{referenced}")' for column, referenced in relationship.join_columns))
+            lines.append(",\n".join(f'        @JoinColumn(name = "{column}", referencedColumnName = "{referenced}", nullable = {nullable})' for column, referenced in relationship.join_columns))
             lines.append("    })")
     elif relationship.annotation == "OneToMany":
         lines.append(f'    @JoinColumn(name = "{entity.variable_name}_id")')
@@ -671,7 +896,7 @@ def generate_model(base_package: str, entity: Entity) -> GeneratedFile:
 
     fields: list[str] = []
     model_attributes = (
-        [attribute for attribute in entity.attributes if not attribute.primary_key]
+        [attribute for attribute in entity.attributes if attribute.java_name not in entity.inherited_fields]
         if entity.parent_class_name
         else entity.attributes
     )
@@ -716,12 +941,33 @@ def generate_model(base_package: str, entity: Entity) -> GeneratedFile:
         fields.extend(relationship_field_declaration(entity, relationship))
         fields.append("")
 
+    has_fields = bool(fields)
+    if entity.contract_methods:
+        imports.extend(["java.math.BigDecimal", "java.time.LocalDate", "java.time.LocalDateTime"])
+        for signature in entity.contract_methods.values():
+            fields.extend([
+                "    @Override",
+                f"    public {signature} {{",
+                '        throw new UnsupportedOperationException("Implementa la operación definida por el contrato UML.");',
+                "    }",
+                "",
+            ])
+
     inheritance_annotation = (
         ["@Inheritance(strategy = InheritanceType.JOINED)"]
-        if entity.inheritance_parent
+        if entity.inheritance_parent and not entity.parent_class_name
         else []
     )
     extends_clause = f" extends {entity.parent_class_name}" if entity.parent_class_name else ""
+    implements_clause = f" implements {', '.join(entity.interfaces)}" if entity.interfaces else ""
+    class_modifier = "abstract " if entity.abstract else ""
+    composite_uniques = [
+        "@UniqueConstraint(columnNames = {" + ", ".join(f'"{column}"' for column, _ in rel.join_columns) + "})"
+        for rel in entity.relationships if rel.annotation == "OneToOne" and len(rel.join_columns) > 1
+    ]
+    table_annotation = f'@Table(name = "{entity.table_name}"'
+    if composite_uniques:
+        table_annotation += ", uniqueConstraints = {" + ", ".join(composite_uniques) + "}"
 
     content = "\n".join(
         [
@@ -730,13 +976,13 @@ def generate_model(base_package: str, entity: Entity) -> GeneratedFile:
             *[f"import {item};" for item in sorted(set(imports))],
             "",
             "@Entity",
-            f'@Table(name = "{entity.table_name}")',
+            table_annotation + ")",
             *inheritance_annotation,
             "@Getter",
             "@Setter",
             "@NoArgsConstructor",
-            "@AllArgsConstructor",
-            f"public class {entity.class_name}{extends_clause} {{",
+            *(["@AllArgsConstructor"] if has_fields else []),
+            f"public {class_modifier}class {entity.class_name}{extends_clause}{implements_clause} {{",
             *fields,
             "}",
             "",
@@ -795,11 +1041,7 @@ def dto_field_declaration(attribute: Attribute, required: bool = False) -> list[
 def generate_request_dto(base_package: str, entity: Entity) -> GeneratedFile:
     """Genera el DTO usado para crear o actualizar una entidad."""
 
-    attributes = [
-        attribute
-        for attribute in entity.attributes
-        if not attribute.primary_key or entity.is_composite_id or not entity.generated_id
-    ]
+    attributes = request_attributes(entity)
     imports = [
         "lombok.Getter",
         "lombok.Setter",
@@ -814,6 +1056,7 @@ def generate_request_dto(base_package: str, entity: Entity) -> GeneratedFile:
         imports.extend(["jakarta.validation.constraints.NotBlank", "jakarta.validation.constraints.NotNull"])
 
     imports.extend(common_imports(attributes))
+    imports.extend(reference_id_imports(base_package, entity))
 
     fields: list[str] = []
 
@@ -857,9 +1100,11 @@ def generate_response_dto(base_package: str, entity: Entity) -> GeneratedFile:
         "lombok.NoArgsConstructor",
         "lombok.Setter",
     ]
-    imports.extend(common_imports(entity.attributes))
+    attributes = entity.attributes + reference_attributes(entity)
+    imports.extend(common_imports(attributes))
+    imports.extend(reference_id_imports(base_package, entity))
 
-    fields = [f"    private {attribute.java_type} {attribute.java_name};" for attribute in entity.attributes]
+    fields = [f"    private {attribute.java_type} {attribute.java_name};" for attribute in attributes]
 
     content = "\n".join(
         [
@@ -921,14 +1166,20 @@ def generate_service(base_package: str, entity: Entity) -> GeneratedFile:
         f"        {model_var}.{setter_name(attribute)}({request_var}.{getter_name(attribute)}());"
         for attribute in editable_attributes
     ]
-    response_args = ", ".join(
+    response_values = [
         (
             f"{model_var}.getId().{getter_name(attribute)}()"
             if entity.is_composite_id and attribute.primary_key
             else f"{model_var}.{getter_name(attribute)}()"
         )
         for attribute in entity.attributes
-    )
+    ]
+    for relationship in entity.relationships:
+        if relationship.request_field:
+            related = f"{model_var}.get{relationship.field_name[:1].upper()}{relationship.field_name[1:]}()"
+            id_getter = relationship.target_id_field[:1].upper() + relationship.target_id_field[1:]
+            response_values.append(f"{related} == null ? null : {related}.get{id_getter}()")
+    response_args = ", ".join(response_values)
     composite_id_assignment = ""
     if entity.is_composite_id:
         id_arguments = ", ".join(
@@ -939,18 +1190,28 @@ def generate_service(base_package: str, entity: Entity) -> GeneratedFile:
         )
 
     relationship_assignments = []
-    for relationship in mapped_relationships:
+    writable_relationships = mapped_relationships + [r for r in entity.relationships if r.request_field]
+    update_relationship_assignments = []
+    for relationship in writable_relationships:
         repository_var = f"{relationship.field_name}Repository"
-        request_getter = f"get{relationship.maps_id[:1].upper()}{relationship.maps_id[1:]}"
+        request_field = relationship.maps_id or relationship.request_field
+        request_getter = f"get{request_field[:1].upper()}{request_field[1:]}"
         setter = f"set{relationship.field_name[:1].upper()}{relationship.field_name[1:]}"
-        relationship_assignments.extend(
+        request_id = f"request.{request_getter}()"
+        lookup = f"{repository_var}.findById({request_id})"
+        if not relationship.required:
+            lookup = f"{request_id} == null ? null : {lookup}"
+        assignments = (
             [
                 f"        {model_var}.{setter}(",
-                f"                {repository_var}.findById(request.{request_getter}())",
+                f"                {lookup}",
                 "                        .orElseThrow(() -> new ResourceNotFoundException(",
                 f'                                "{relationship.target_class_name} no encontrado")));',
             ]
         )
+        relationship_assignments.extend(assignments)
+        if relationship.request_field:
+            update_relationship_assignments.extend(assignments)
 
     dependency_fields = [f"    private final {entity.class_name}Repository {repo_var};"]
     constructor_parameters = [f"{entity.class_name}Repository {repo_var}"]
@@ -960,8 +1221,10 @@ def generate_service(base_package: str, entity: Entity) -> GeneratedFile:
         extra_imports.append(
             f"import {base_package}.models.{entity.composite_id_class_name};"
         )
-    for relationship in mapped_relationships:
+    for relationship in writable_relationships:
         repository_var = f"{relationship.field_name}Repository"
+        if repository_var == repo_var:
+            continue
         dependency_fields.append(
             f"    private final {relationship.target_class_name}Repository {repository_var};"
         )
@@ -980,7 +1243,7 @@ def generate_service(base_package: str, entity: Entity) -> GeneratedFile:
     ]
     # Una clave compuesta identifica al recurso y no debe cambiarse durante PUT.
     # Las relaciones @MapsId se conservan a partir de la entidad ya recuperada.
-    update_assignments = update_attribute_assignments
+    update_assignments = [*update_relationship_assignments, *update_attribute_assignments]
 
     content = f"""package {base_package}.services;
 
@@ -1201,7 +1464,7 @@ def generate_backend_metadata_controller(
                         "type": map_schema_type(attribute.java_type),
                         "required": not attribute.nullable,
                     }
-                    for attribute in entity.attributes
+                    for attribute in entity.attributes + reference_attributes(entity)
                     if not attribute.primary_key
                 },
                 "operaciones": [
@@ -1293,6 +1556,20 @@ def request_attributes(entity: Entity) -> list[Attribute]:
         attribute
         for attribute in entity.attributes
         if not attribute.primary_key or entity.is_composite_id or not entity.generated_id
+    ] + reference_attributes(entity)
+
+
+def reference_attributes(entity: Entity) -> list[Attribute]:
+    return [
+        Attribute(r.request_field, r.request_field, r.target_id_type, False, True, not r.required)
+        for r in entity.relationships if r.request_field
+    ]
+
+
+def reference_id_imports(base_package: str, entity: Entity) -> list[str]:
+    return [
+        f"{base_package}.models.{r.target_id_type}"
+        for r in entity.relationships if r.request_field and len(r.join_columns) > 1
     ]
 
 
@@ -1363,7 +1640,7 @@ def generate_readme(
         }
         response_body = {
             attribute.java_name: json_example_value(attribute.java_type)
-            for attribute in entity.attributes
+            for attribute in entity.attributes + reference_attributes(entity)
         }
         request_json = json.dumps(request_body, ensure_ascii=False, indent=2)
         response_json = json.dumps(response_body, ensure_ascii=False, indent=2)
@@ -1863,15 +2140,31 @@ def build_spring_boot_project(
     entities, warnings = parse_entities(context)
     files: list[GeneratedFile] = []
 
-    files.extend(generate_common_files(base_package, project_name, database_name, entities))
+    concrete_entities = [entity for entity in entities if not entity.abstract]
+    files.extend(generate_common_files(base_package, project_name, database_name, concrete_entities))
     files.append(generate_application(base_package, project_name))
-    files.append(generate_backend_metadata_controller(base_package, project_name, entities))
+    files.append(generate_backend_metadata_controller(base_package, project_name, concrete_entities))
+
+    model_paths = set()
+    for node in ((context.get("diagrama") or {}).get("contenido") or {}).get("nodes") or []:
+        data = node.get("data") or {}
+        if data.get("kind") != "interface" or data.get("templateParameters"):
+            continue
+        interface = generate_interface(base_package, data)
+        if interface.path in model_paths or any(
+            interface.path.endswith(f"/{entity.class_name}.java") for entity in entities
+        ):
+            raise ValueError(f"Nombre Java de interfaz duplicado: {data.get('name')}.")
+        model_paths.add(interface.path)
+        files.append(interface)
 
     for entity in entities:
         if entity.is_composite_id:
             files.append(generate_composite_id_class(base_package, entity))
         files.append(generate_model(base_package, entity))
         files.append(generate_repository(base_package, entity))
+        if entity.abstract:
+            continue
         files.append(generate_request_dto(base_package, entity))
         files.append(generate_response_dto(base_package, entity))
         files.append(generate_service(base_package, entity))

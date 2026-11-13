@@ -10,6 +10,45 @@ from app.schemas.chat import PlannerResponse, PlannerAction
 
 
 class DatabaseDesignPlanTest(unittest.TestCase):
+    def test_generation_keeps_uml_semantics_instead_of_converting_all_links_to_associations(self):
+        sketch = DesignSketch.model_validate({
+            "tables": [
+                {"name": "Pedido", "attributes": []},
+                {"name": "LineaPedido", "attributes": ["cantidad"]},
+                {"name": "PedidoLocal", "attributes": []},
+                {"name": "Facturable", "kind": "interface", "attributes": []},
+                {"name": "Sucursal", "attributes": ["nombre"]},
+            ],
+            "foreign_keys": [
+                {"table": "LineaPedido", "references": "Pedido", "column": "id_pedido", "relation": "composition"},
+                {"table": "Pedido", "references": "Sucursal", "column": "id_sucursal", "relation": "aggregation"},
+            ],
+            "structural_links": [
+                {"source": "PedidoLocal", "target": "Pedido", "relation": "generalization"},
+                {"source": "Pedido", "target": "Facturable", "relation": "realization"},
+            ],
+        })
+        result = build_plan(Interpretation(intent="modify_diagram", commands=design_commands(sketch, {})), {})
+        self.assertTrue(result.can_execute, result.questions)
+        links = [action.arguments for action in result.actions if action.tool == "create_relation"]
+        self.assertEqual([link["relationType"] for link in links], ["composition", "aggregation", "generalization", "realization"])
+        self.assertNotIn("targetCardinality", links[-1])
+
+    def test_new_template_and_binding_can_be_created_in_same_plan(self):
+        sketch = DesignSketch.model_validate({
+            "tables": [
+                {"name": "Caja", "attributes": ["valor"], "template_parameters": ["T"], "attribute_types": {"valor": "T"}},
+                {"name": "CajaTexto", "attributes": []},
+            ],
+            "structural_links": [
+                {"source": "CajaTexto", "target": "Caja", "relation": "templateBinding", "template_bindings": {"T": "String"}},
+            ],
+        })
+        result = build_plan(Interpretation(intent="modify_diagram", commands=design_commands(sketch, {})), {})
+        self.assertTrue(result.can_execute, result.questions)
+        self.assertEqual(result.actions[0].arguments["attributes"][0]["type"], "T")
+        self.assertEqual(result.actions[-1].arguments["templateBindings"], {"T": "String"})
+
     def test_optional_disconnected_table_is_not_added_to_initial_core(self):
         sketch = DesignSketch(tables=[DesignTable(name=n, attributes=["nombre"]) for n in ("Cliente", "Venta", "Opcional")],
                               foreign_keys=[DesignForeignKey(table="Venta", column="cliente_id", references="Cliente")])

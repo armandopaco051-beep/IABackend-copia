@@ -50,6 +50,8 @@ Si pregunta qué atributos, tablas o clases sugieres para el sistema, usa intent
 - Para relaciones usa relationType con uno de estos valores:
   association, generalization, composition, aggregation, associationClass,
   realization, templateBinding.
+- Al diseñar un sistema completo, elige cada vínculo según los requisitos, aunque el usuario no indique su tipo. Una línea de pedido exclusiva y dependiente puede ser composición; una parte independiente puede ser agregación; una referencia ordinaria es asociación. Un subtipo real usa generalización; realización requiere un contrato de interfaz; templateBinding requiere plantilla y sustituciones. No fuerces tipos para completar una lista y no sustituyas vínculos estructurales por asociaciones.
+- Para realization crea o reutiliza una clase destino con kind="interface". Para templateBinding crea o reutiliza una clase destino con templateParameters y rellena templateBindings en la relación. Al cambiar o quitar una relación usa su id cuando esté disponible y conserva los elementos que no se pidieron cambiar.
 - «Une», «asocia», «enlaza», «conecta» y «vincula» pueden pedir crear una relación entre dos clases. «Desvincula», «desconecta» o «quita el enlace» piden retirar el vínculo, conservando sus clases. «Cambia la cardinalidad» actualiza el vínculo existente. Identifica los extremos en el diagrama activo y conserva las multiplicidades explícitas.
 - REGLA PARA CLASES DE ASOCIACION (associationClass): Las claves primarias (PK) de ambas clases relacionadas forman la clave primaria compuesta en la clase intermedia (marcando cada una con primaryKey=true y foreignKey=true), ademas de sus atributos propios (ej: fecha, nota, estado).
 - Para association, associationClass, aggregation y composition usa solo estas

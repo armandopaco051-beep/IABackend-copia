@@ -1,6 +1,6 @@
 import unittest
 
-from app.services.spring_boot_builder import parse_entities, generate_model
+from app.services.spring_boot_builder import parse_entities, generate_model, generate_request_dto, generate_service
 
 
 class DerivedKeyCodegenTest(unittest.TestCase):
@@ -16,6 +16,10 @@ class DerivedKeyCodegenTest(unittest.TestCase):
             "relationType": "association", "sourceCardinality": "1", "targetCardinality": "1..*"}}]}}}
         entities, _ = parse_entities(context)
         cliente, venta = [generate_model("com.test", e).content for e in entities]
-        self.assertIn('@JoinColumn(name = "id_cliente", referencedColumnName = "id")', cliente)
+        self.assertIn('@OneToMany(mappedBy = "cliente")', cliente)
+        self.assertIn('@ManyToOne(optional = false)', venta)
+        self.assertIn('@JoinColumn(name = "id_cliente", referencedColumnName = "id", nullable = false)', venta)
         self.assertNotIn("private Long idCliente;", venta)
         self.assertIn("private Long id;", venta)
+        self.assertIn("@NotNull\n    private Long idCliente;", generate_request_dto("com.test", entities[1]).content)
+        self.assertIn("clienteRepository.findById(request.getIdCliente())", generate_service("com.test", entities[1]).content)

@@ -82,6 +82,7 @@ def build_plan(parsed: Interpretation, context: dict | None):
                 if cmd.template_parameters:
                     actions[-1].arguments["templateParameters"] = cmd.template_parameters
                     created["data"]["templateParameters"] = cmd.template_parameters
+                    created["data"]["templateParameters"] = cmd.template_parameters
             elif cmd.operation in {"update_class", "delete_class", "move_class"}:
                 target = node(cmd.name)
                 name = target["data"]["name"]
@@ -112,6 +113,8 @@ def build_plan(parsed: Interpretation, context: dict | None):
                         args["attributes"] = merged
                     if cmd.kind:
                         args["kind"] = cmd.kind
+                    if cmd.template_parameters:
+                        args["templateParameters"] = cmd.template_parameters
                     if cmd.methods or cmd.remove_methods or cmd.rename_methods:
                         removed = {key(n) for n in cmd.remove_methods}
                         methods = [m for m in deepcopy(target["data"].get("methods") or []) if key(m.get("name")) not in removed]

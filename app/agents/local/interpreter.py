@@ -18,6 +18,7 @@ class NewClass(BaseModel):
     name: str
     attributes: list[Attribute] = Field(default_factory=list, max_length=20)
     kind: Literal["class", "interface"] = "class"
+    template_parameters: list[str] = Field(default_factory=list)
 
 
 class RelationExtraction(BaseModel):
@@ -45,6 +46,7 @@ class ClassExtraction(BaseModel):
     x: float | None = None
     y: float | None = None
     kind: Literal["class", "interface"] | None = None
+    template_parameters: list[str] = Field(default_factory=list)
 
 
 class AdvisoryExtraction(BaseModel):
@@ -59,13 +61,26 @@ class Explanation(BaseModel):
 
 class DesignTable(BaseModel):
     name: str
-    attributes: list[str] = Field(min_length=1, max_length=5)
+    attributes: list[str] = Field(max_length=5)
+    kind: Literal["class", "interface"] = "class"
+    template_parameters: list[str] = Field(default_factory=list)
+    attribute_types: dict[str, str] = Field(default_factory=dict)
 
 
 class DesignForeignKey(BaseModel):
     table: str
     column: str
     references: str
+    relation: Literal["association", "aggregation", "composition"] = "association"
+    source_cardinality: Literal["1", "0..1"] = "1"
+    target_cardinality: Literal["1", "0..1", "0..*", "1..*"] = "0..*"
+
+
+class DesignStructuralLink(BaseModel):
+    source: str
+    target: str
+    relation: Literal["generalization", "realization", "templateBinding"]
+    template_bindings: dict[str, str] = Field(default_factory=dict)
 
 
 class DesignAssociation(BaseModel):
@@ -76,8 +91,9 @@ class DesignAssociation(BaseModel):
 
 class DesignSketch(BaseModel):
     tables: list[DesignTable] = Field(min_length=2, max_length=5)
-    foreign_keys: list[DesignForeignKey] = Field(min_length=1, max_length=6)
+    foreign_keys: list[DesignForeignKey] = Field(default_factory=list, max_length=8)
     association_classes: list[DesignAssociation] = Field(default_factory=list, max_length=3)
+    structural_links: list[DesignStructuralLink] = Field(default_factory=list, max_length=5)
 
     @model_validator(mode="after")
     def normalize_foreign_columns(self):
@@ -104,7 +120,18 @@ class DesignSketch(BaseModel):
             association.source = canonical(association.source)
             association.target = canonical(association.target)
             association.intermediate = canonical(association.intermediate)
+        for link in self.structural_links:
+            link.source = canonical(link.source)
+            link.target = canonical(link.target)
         return self
+
+
+def design_connections(sketch):
+    yield from ((fk.table, fk.references) for fk in sketch.foreign_keys)
+    yield from ((link.source, link.target) for link in sketch.structural_links)
+    for link in sketch.association_classes:
+        yield link.source, link.intermediate
+        yield link.target, link.intermediate
 
 
 def design_commands(sketch, context):
@@ -114,14 +141,15 @@ def design_commands(sketch, context):
     existing = {str((n.get("data") or {}).get("name", "")).casefold(): n
                 for n in (((context or {}).get("diagrama") or {}).get("contenido") or {}).get("nodes", [])}
     middle_names = {a.intermediate.casefold() for a in sketch.association_classes}
-    connected = {name.casefold() for fk in sketch.foreign_keys for name in (fk.table, fk.references)}
-    connected |= {name.casefold() for a in sketch.association_classes for name in (a.source, a.target, a.intermediate)}
+    connected = {name.casefold() for pair in design_connections(sketch) for name in pair}
+    if connected - set(names):
+        raise ValueError("Un vínculo apunta a una clase ausente del diseño.")
     isolated = set(names) - connected
     if isolated:
         raise ValueError("El diseño deja tablas sin ninguna relación: " + ", ".join(sorted(isolated)) + ". Incluye vínculos justificados o elimina tablas opcionales de la propuesta.")
     adjacency = {name: set() for name in names}
-    for fk in sketch.foreign_keys:
-        a, b = fk.table.casefold(), fk.references.casefold()
+    for source, target in design_connections(sketch):
+        a, b = source.casefold(), target.casefold()
         adjacency[a].add(b)
         adjacency[b].add(a)
     visited, pending = set(), [next(iter(names))]
@@ -138,13 +166,14 @@ def design_commands(sketch, context):
     fk_columns = {(fk.table.casefold(), fk.column.casefold()) for fk in sketch.foreign_keys}
     commands = []
     for table in sketch.tables:
-        fields = [Attribute(name=a, type="VARCHAR") for a in table.attributes
+        fields = [Attribute(name=a, type=table.attribute_types.get(a, "VARCHAR")) for a in table.attributes
                   if a.casefold() != "id" and (table.name.casefold(), a.casefold()) not in fk_columns
                   and not re.fullmatch(r"id_.+|.+_id", a.casefold())]
         if table.name.casefold() not in existing:
-            if table.name.casefold() not in middle_names:
+            if table.name.casefold() not in middle_names and table.kind != "interface" and not table.template_parameters:
                 fields.insert(0, Attribute(name="id", type="BIGINT", primaryKey=True, nullable=False))
-            commands.append(Command(operation="create_class", name=table.name, attributes=fields))
+            commands.append(Command(operation="create_class", name=table.name, attributes=fields,
+                                    kind=table.kind, template_parameters=table.template_parameters))
         else:
             node = existing[table.name.casefold()]
             known = {str(a.get("name", "")).casefold() for a in (node.get("data") or {}).get("attributes", [])}
@@ -179,7 +208,16 @@ def design_commands(sketch, context):
             continue
         pairs.add(pair)
         commands.append(Command(operation="create_relation", source=names[fk.references.casefold()], target=names[fk.table.casefold()],
-                                relation="association", source_cardinality="1", target_cardinality="0..*"))
+                                relation=fk.relation, source_cardinality=fk.source_cardinality,
+                                target_cardinality=fk.target_cardinality))
+    directed = {(current_names.get(str(e.get("source"))), current_names.get(str(e.get("target"))),
+                 (e.get("data") or {}).get("relationType")) for e in graph.get("edges", [])}
+    for link in sketch.structural_links:
+        identity = (link.source.casefold(), link.target.casefold(), link.relation)
+        if identity not in directed:
+            directed.add(identity)
+            commands.append(Command(operation="create_relation", source=names[identity[0]], target=names[identity[1]],
+                                    relation=link.relation, template_bindings=link.template_bindings))
     return commands
 
 
@@ -187,8 +225,8 @@ def connected_design(sketch, message, context):
     """Conserva el núcleo conectado; nunca omite clases explícitas o existentes."""
     names = {t.name.casefold() for t in sketch.tables}
     adjacency = {name: set() for name in names}
-    for fk in sketch.foreign_keys:
-        a, b = fk.table.casefold(), fk.references.casefold()
+    for source, target in design_connections(sketch):
+        a, b = source.casefold(), target.casefold()
         if a not in names or b not in names:
             raise ValueError("El diseño refiere una tabla ausente.")
         adjacency[a].add(b)
@@ -215,19 +253,28 @@ def connected_design(sketch, message, context):
     associations = []
     for association in sketch.association_classes:
         middle = association.intermediate.casefold()
-        parents = sorted({fk.references for fk in sketch.foreign_keys if fk.table.casefold() == middle and fk.references.casefold() != middle})
-        if middle in keep and len(parents) == 2:
-            associations.append(DesignAssociation(source=parents[0], target=parents[1], intermediate=association.intermediate))
+        if {middle, association.source.casefold(), association.target.casefold()} <= keep:
+            associations.append(association)
     return DesignSketch(tables=[t for t in sketch.tables if t.name.casefold() in keep],
                        foreign_keys=[fk for fk in sketch.foreign_keys if fk.table.casefold() in keep and fk.references.casefold() in keep],
-                       association_classes=associations)
+                       association_classes=associations,
+                       structural_links=[link for link in sketch.structural_links
+                                         if {link.source.casefold(), link.target.casefold()} <= keep])
 
 
 def describe_design(sketch):
     names = {t.name.casefold(): t.name for t in sketch.tables}
     if len(names) != len(sketch.tables):
         raise ValueError("El diseño repite tablas.")
-    columns = {t.name: ["id (PK)", *[a for a in t.attributes if a.casefold().strip() != "id"]] for t in sketch.tables}
+    without_own_id = {link.source.casefold() for link in sketch.structural_links if link.relation == "generalization"}
+    without_own_id.update(link.intermediate.casefold() for link in sketch.association_classes)
+    columns = {
+        t.name: [
+            *(["id (PK)"] if t.kind != "interface" and not t.template_parameters and t.name.casefold() not in without_own_id else []),
+            *[a for a in t.attributes if a.casefold().strip() != "id"],
+        ]
+        for t in sketch.tables
+    }
     relationships = []
     for fk in sketch.foreign_keys:
         owner, parent = names.get(fk.table.casefold()), names.get(fk.references.casefold())
@@ -237,8 +284,10 @@ def describe_design(sketch):
             raise ValueError("La FK propuesta sobrescribe la PK de la tabla.")
         columns[owner] = [a for a in columns[owner] if a.casefold().strip() != fk.column.casefold().strip()]
         columns[owner].append(f"{fk.column} (FK → {parent}.id)")
-        relationships.append(f"{parent} 1 — 0..* {owner}")
-    return ("Propuesta inicial; cada tabla usa id como PK. Las FK se proponen como referencias a un registro; los mínimos son supuestos editables.\n\n"
+        relationships.append(f"{parent} {fk.source_cardinality} — {fk.target_cardinality} {owner} ({fk.relation})")
+    relationships.extend(f"{link.source} → {link.target} ({link.relation})" for link in sketch.structural_links)
+    relationships.extend(f"{link.source} ↔ {link.target} mediante {link.intermediate}" for link in sketch.association_classes)
+    return ("Propuesta inicial. Las multiplicidades propuestas son revisables.\n\n"
             + "\n".join(f"- {name}: {', '.join(attrs)}." for name, attrs in columns.items())
             + "\n\nRelaciones propuestas:\n" + "\n".join("- " + r for r in relationships)
             + "\n\nEs una propuesta para revisar; todavía no modifica el diagrama.")
@@ -254,16 +303,20 @@ async def repair_design_links(sketch, message, problem):
     names = [t.name for t in sketch.tables]
     fk_schema = {"type": "object", "properties": {
         "table": {"type": "string", "enum": names}, "column": {"type": "string"},
-        "references": {"type": "string", "enum": names}}, "required": ["table", "column", "references"], "additionalProperties": False}
+        "references": {"type": "string", "enum": names},
+        "relation": {"type": "string", "enum": ["association", "aggregation", "composition"]},
+        "source_cardinality": {"type": "string", "enum": ["1", "0..1"]},
+        "target_cardinality": {"type": "string", "enum": ["1", "0..1", "0..*", "1..*"]}},
+        "required": ["table", "column", "references"], "additionalProperties": False}
     assoc_schema = {"type": "object", "properties": {k: {"type": "string", "enum": names} for k in ("source", "target", "intermediate")},
                     "required": ["source", "target", "intermediate"], "additionalProperties": False}
     schema = {"type": "object", "properties": {
-        "foreign_keys": {"type": "array", "minItems": 1, "maxItems": 8, "items": fk_schema},
+        "foreign_keys": {"type": "array", "maxItems": 8, "items": fk_schema},
         "association_classes": {"type": "array", "maxItems": 3, "items": assoc_schema}},
         "required": ["foreign_keys", "association_classes"], "additionalProperties": False}
     response = await native_chat({
         "model": settings.OLLAMA_MODEL, "stream": False, "format": schema,
-        "messages": [{"role": "system", "content": "Relaciona las tablas dadas para el negocio solicitado. Conserva sus nombres EXACTOS. Conecta todas en un conjunto coherente. foreign_keys indica table que guarda column referenciando references.id; no uses id como FK. Una tabla puente necesita dos FK. association_classes es opcional: si la usas, source y target son los DOS padres de la intermedia y los tres nombres deben ser distintos. No crees más tablas."},
+        "messages": [{"role": "system", "content": "Relaciona las tablas dadas. Conserva los nombres EXACTOS y los tipos de vínculos válidos. foreign_keys indica table que guarda column referenciando references.id. Usa composition si la parte pertenece exclusivamente al todo y depende de su ciclo de vida; aggregation si es parte independiente; association si es una referencia. No uses id como FK. No conviertas structural_links en FK, ya se conservan. Una intermedia requiere dos participantes distintos. No crees más tablas."},
                      {"role": "user", "content": json.dumps({"peticion": message, "tablas": [t.model_dump() for t in sketch.tables], "problema_a_corregir": str(problem)}, ensure_ascii=False)}],
         "options": {"temperature": 0, "num_ctx": settings.OLLAMA_CONTEXT_SIZE, "num_predict": 768}})
     response.raise_for_status()
@@ -271,7 +324,13 @@ async def repair_design_links(sketch, message, problem):
     if payload.get("done_reason") == "length":
         raise LocalInferenceError("LOCAL_OUTPUT_TRUNCATED", "El modelo local no completó las relaciones. No se prepararon tablas sueltas.")
     data = json.loads(payload["message"]["content"])
-    return DesignSketch(tables=sketch.tables, **data)
+    original_fks = {(fk.table.casefold(), fk.references.casefold()): fk for fk in sketch.foreign_keys}
+    for fk in data.get("foreign_keys", []):
+        previous = original_fks.get((fk["table"].casefold(), fk["references"].casefold()))
+        if previous:
+            for key in ("relation", "source_cardinality", "target_cardinality"):
+                fk.setdefault(key, getattr(previous, key))
+    return DesignSketch(tables=sketch.tables, structural_links=sketch.structural_links, **data)
 
 
 class RelationEditExtraction(BaseModel):
@@ -283,6 +342,7 @@ class RelationEditExtraction(BaseModel):
     target_cardinality: Literal["1", "0..1", "0..*", "1..*"] | None = None
     relation: Literal["association", "associationClass", "aggregation", "composition", "generalization", "realization", "templateBinding"] | None = None
     intermediate: str | None = None
+    template_bindings: dict[str, str] = Field(default_factory=dict)
 
 
 class RelationReplacementExtraction(BaseModel):
@@ -292,7 +352,7 @@ class RelationReplacementExtraction(BaseModel):
 
 
 RELATION_VERBS = r"\b(?:relaciona|vincula|conecta|enlaza|une|asocia)(?:me|las?|los?)?\b|\bvuelve a conectar\b"
-RELATION_TERMS = r"\b(?:relacion\w*|asociacion\w*|vinculo\w*|enlace\w*|conexion\w*|herencia|composicion|agregacion|realizacion|muchos a muchos|multiplicidad\w*|cardinalidad\w*)\b"
+RELATION_TERMS = r"\b(?:relacion\w*|asociacion\w*|vinculo\w*|enlace\w*|conexion\w*|herencia|generalizacion|composicion|agregacion|realizacion|template\s+bind(?:ing|ling)|vinculacion de plantilla|muchos a muchos|multiplicidad\w*|cardinalidad\w*)\b"
 RELATION_EDIT_VERBS = r"\b(?:elimina|borra|quita|suprime|remueve|desvincula|desconecta|actualiza|modifica|edita|cambia|reemplaza|sustituye|invierte)\b"
 
 
@@ -302,10 +362,28 @@ def is_relation_request(message):
         r"\b(?:sugiere|recomienda|explica|que es|como funciona|cuando se usa)\b", text,
     ):
         return False
-    return bool(re.search(RELATION_VERBS, text) or (
+    return bool(re.search(RELATION_VERBS, text)
+        or re.search(r"\bhereda\b", text)
+        or (re.search(r"\bimplementa\b", text) and re.search(r"\binterfaz\b", text))
+        or (
         re.search(r"\b(?:agrega|crea|anade|incorpora|genera|establece)\b", text)
         and re.search(RELATION_TERMS, text)
     ))
+
+
+def explicitly_requested_relation(text: str):
+    match = re.search(
+        r"\b(?:mediante|como|por|a|de tipo)\s+(?:una?\s+)?"
+        r"(composicion|agregacion|generalizacion|herencia|realizacion|"
+        r"template\s+bind(?:ing|ling)|vinculacion de plantilla)\b", text,
+    )
+    if not match:
+        return None
+    return {
+        "composicion": "composition", "agregacion": "aggregation",
+        "generalizacion": "generalization", "herencia": "generalization",
+        "realizacion": "realization",
+    }.get(match.group(1), "templateBinding")
 
 
 def explicit_multiplicities(text):
@@ -418,6 +496,7 @@ Si solo pide eliminar la relación sin reemplazo, usa delete_relation y particip
 No elimines clases ni la clase intermedia. No cambies multiplicidades salvo que el usuario lo pida.
 Si pide cambiar el tipo UML, informa relation con el tipo nuevo; si no lo pide, relation=null conserva el actual.
 intermediate solo indica una clase de asociación nueva solicitada expresamente.
+Para templateBinding, extrae template_bindings, por ejemplo {"T":"String"}. Para realización, el destino es una interfaz. Para generalización, la fuente es la subclase. En composición y agregación, la fuente es el todo.
 """
         schema = RelationEditExtraction.model_json_schema()
         if replacement:
@@ -507,7 +586,9 @@ foreign_keys contiene los vínculos esenciales: table es la tabla que guarda col
 Todos los nombres de table y references deben existir en tables. No uses id como columna FK.
 Una muchos a muchos se representa con una tabla puente y sus dos FK.
 Genera los datos del diseño, no una introducción, promesa ni instrucciones.
-Toda tabla debe participar en al menos una relación justificada. Evita entidades opcionales desconectadas.
+Toda clase debe participar en una relación justificada. No fuerces tipos para que aparezcan en la respuesta.
+En foreign_keys, references es el todo o la entidad referenciada, table es la parte o la que guarda la FK. Usa relation=composition si la parte es exclusiva y su ciclo de vida depende del todo (por ejemplo LíneaPedido de Pedido). Usa aggregation si hay una relación todo-parte y las partes existen de manera independiente. Usa association para referencias normales. Indica source_cardinality y target_cardinality según el negocio.
+En structural_links usa generalization solo para subtipo → tipo; realization para clase → interfaz (kind=interface, sin PK); templateBinding solo para clase concreta → plantilla con template_parameters, completando template_bindings. Para atributos genéricos usa attribute_types, por ejemplo {"valor":"T"}. Estos vínculos no se repiten como foreign_keys.
 Si identificas muchos a muchos con tabla puente, incluye source,target,intermediate en association_classes; incluye también sus dos FK.
 """
             schema = DesignSketch.model_json_schema()
@@ -542,12 +623,16 @@ Usa únicamente el diagrama actual para afirmar qué elementos existen.
         else:
             edit = RelationEditExtraction.model_validate_json(content)
             data = edit.model_dump()
+            requested_type = explicitly_requested_relation(text)
+            if requested_type and data["operation"] == "update_relation":
+                data["relation"] = requested_type
         cardinalities = explicit_multiplicities(text)
         if cardinalities:
             data.update(source_cardinality=cardinalities[0], target_cardinality=cardinalities[1])
         return Interpretation(intent="modify_diagram", commands=[Command(**data)])
     if relation_only:
         relation = RelationExtraction.model_validate_json(content)
+        relation.relation = explicitly_requested_relation(text) or relation.relation
         cardinalities = explicit_multiplicities(text)
         if cardinalities:
             relation.source_cardinality, relation.target_cardinality = cardinalities
@@ -566,7 +651,8 @@ Usa únicamente el diagrama actual para afirmar qué elementos existen.
                                and re.search(r"(?<!\w)" + re.escape(a.name) + r"(?!\w)", message, re.IGNORECASE)]
         existing_names = {str((n.get("data") or {}).get("name", "")).casefold() for n in (((context or {}).get("diagrama") or {}).get("contenido") or {}).get("nodes", [])}
         creations = [Command(operation="create_class", name=n.name,
-                             attributes=[a for a in n.attributes if re.search(r"(?<!\w)" + re.escape(a.name) + r"(?!\w)", message, re.IGNORECASE)], kind=n.kind)
+                             attributes=[a for a in n.attributes if re.search(r"(?<!\w)" + re.escape(a.name) + r"(?!\w)", message, re.IGNORECASE)],
+                             kind=n.kind, template_parameters=n.template_parameters)
                      for n in relation.new_classes if creates_participants and n.name.casefold() not in existing_names]
         return Interpretation(intent="modify_diagram", commands=[*creations, Command(operation="create_relation", **relation.model_dump(exclude={"new_classes"}))])
     if class_only:

@@ -311,7 +311,17 @@ async def codegen(
     token = extract_token(authorization)
 
     if datos.proyecto_id is not None:
-        await verify_user_permission(datos.proyecto_id, token, min_role="EDITOR")
+        try:
+            await verify_user_permission(datos.proyecto_id, token, min_role="EDITOR")
+        except httpx.TimeoutException as exc:
+            raise HTTPException(504, "El backend principal tardó demasiado al verificar los permisos. Reintenta la generación.") from exc
+        except httpx.HTTPStatusError as exc:
+            upstream_status = exc.response.status_code
+            if upstream_status in {401, 403, 404}:
+                raise HTTPException(upstream_status, "No se pudo verificar tu acceso al proyecto.") from exc
+            raise HTTPException(502, "El backend principal no pudo verificar los permisos del proyecto.") from exc
+        except httpx.RequestError as exc:
+            raise HTTPException(503, "No se pudo conectar con el backend principal para verificar los permisos.") from exc
 
     context = await build_context(datos.proyecto_id, datos.diagrama_id, token)
 
